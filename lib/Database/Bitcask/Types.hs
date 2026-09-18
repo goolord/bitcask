@@ -181,6 +181,12 @@ data BitcaskError
   | NotAStore !FilePath
   | WriteToReadOnly
   | UseAfterClose
+  | -- | A write failed in a way that leaves the end of the active data file in
+    -- an unknown state: an @fsync@ failed, or a failed append could not be
+    -- undone. Every later write fails with this rather than risk recording
+    -- data at the wrong place. Reads still work. Close and reopen the store to
+    -- recover; reopening repairs the file. The message says what failed.
+    StoreBroken !String
   deriving stock (Show)
   deriving anyclass (Exception)
 

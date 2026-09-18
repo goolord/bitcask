@@ -23,6 +23,7 @@ module Database.Bitcask.Internal.Platform
   , appendBytes
   , syncFile
   , closeAppend
+  , truncateAppend
   , syncDir
   , truncateAt
   , LockMode (..)
@@ -44,7 +45,7 @@ import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import System.Directory (removeFile)
 import System.IO (IOMode (..), SeekMode (..), openBinaryFile)
-import System.Posix.Files (setFileSize)
+import System.Posix.Files (setFdSize, setFileSize)
 import System.Posix.IO
   ( FileLock
   , LockRequest (..)
@@ -130,6 +131,16 @@ syncFile (AppendHandle fd) = fileSynchronise fd
 
 closeAppend :: AppendHandle -> IO ()
 closeAppend (AppendHandle fd) = closeFd fd
+
+-- | Cut the file back to @n@ bytes and put the write position there, undoing an
+-- append that failed part-way. Both halves matter: appends go to the
+-- descriptor's file position, which a partial write has already moved, so
+-- truncating alone would leave the next append writing past a hole.
+truncateAppend :: AppendHandle -> Word64 -> IO ()
+truncateAppend (AppendHandle fd) n = do
+  setFdSize fd (fromIntegral n)
+  _ <- fdSeek fd AbsoluteSeek (fromIntegral n)
+  pure ()
 
 -- | @fsync@ the directory, which is what makes a newly /created/ file durable.
 -- There is no equivalent on Windows and none is needed there.

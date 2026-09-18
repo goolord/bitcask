@@ -30,3 +30,22 @@
     each data file is read through a small pool of handles, one per
     capability, because Windows serialises I/O on a synchronous handle.
   * The library is built with `-O2`.
+* Write safety. A write that failed or was interrupted part-way used to leave
+  the store's idea of where the active file ends out of step with the file, so
+  that every later write recorded the wrong location and read back as missing.
+  Now:
+  * The write path runs with asynchronous exceptions masked, so a `timeout` or
+    `killThread` leaves a write either done or not done.
+  * A failed append is undone by truncating the file back.
+  * A failed `fsync`, or an append that cannot be undone, marks the store
+    broken: later writes, `sync` and `merge` throw the new `StoreBroken` until
+    the store is reopened. Reads are unaffected.
+  * A failed hint write costs that file its hint, never the write.
+  * Rolling to a new active file opens it before closing the old one, so
+    failing to open it leaves the store usable.
+  * `close` releases every handle and the lock even when finishing the active
+    file fails, and throws the failure afterwards.
+  * A merge that fails closes its output and never removes its inputs unless
+    the output was synced.
+  * Internal fault hooks (`injectFault`) let the test suite exercise each of
+    these paths.

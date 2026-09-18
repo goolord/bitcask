@@ -29,8 +29,8 @@ module Database.Bitcask.Internal.Merge
   ) where
 
 import Control.Concurrent.MVar
-import Control.Exception (throwIO)
-import Control.Monad (foldM, when)
+import Control.Exception (SomeException, mask_, onException, throwIO, try)
+import Control.Monad (foldM, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
@@ -43,7 +43,7 @@ import qualified Data.Set as Set
 import Database.Bitcask.Internal.File (dataPath, hintPath, listDataFiles, readPending, writePending)
 import Database.Bitcask.Internal.Hint (HintEntry (..), encodeHintEntry)
 import qualified Database.Bitcask.Internal.Keydir as KD
-import Database.Bitcask.Internal.Platform (appendBytes, preadAt, removeOpen)
+import Database.Bitcask.Internal.Platform (closeAppend, preadAt, removeOpen)
 import Database.Bitcask.Internal.Record (Record (..), decodeRecord)
 import Database.Bitcask.Internal.Store
 import Database.Bitcask.Types
@@ -69,11 +69,13 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
 
   -- Roll first, so that every file we are about to read is immutable for the
   -- whole merge. This is the only point where merge touches the write path.
-  activeFid <- modifyMVar (stActive st) $ \case
-    Nothing -> throwIO WriteToReadOnly
-    Just ac -> do
-      ac' <- if acOffset ac > 0 then rollActive st ac else pure ac
-      pure (Just ac', acFileId ac')
+  -- A broken store refuses this like any other write.
+  activeFid <- withActive st $ \ac ->
+    if acOffset ac > 0
+      then do
+        (ac', err) <- rollActive st ac
+        pure (ac', maybe (Right (acFileId ac')) Left err)
+      else pure (ac, Right (acFileId ac))
 
   allFids <- listDataFiles (stDir st)
   let inputs = filter (< activeFid) allFids
@@ -98,14 +100,26 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
       kd <- readIORef (stKeydir st)
       let todo = [(k, l) | (k, l) <- KD.toList kd, locFileId l `Set.member` inputSet]
 
-      out0 <- openActive (stDir st) (mkFileId outBase firstSub)
-      bumpTotal st (acFileId out0) 0
-      out <- sweepRecords st (copyOne st) (Out out0 [] [] 0 0) todo >>= flushOut st
-      closeActive st (outActive out)
+      -- The output file currently open, if any, so that a merge that fails part
+      -- way can close it; see 'abandonOutput'.
+      current <- newIORef Nothing
+      out <-
+        ( do
+            out0 <- mask_ $ do
+              o <- openActive (stDir st) (mkFileId outBase firstSub)
+              writeIORef current (Just o)
+              pure o
+            bumpTotal st (acFileId out0) 0
+            out <- sweepRecords st (copyOne st current) (Out out0 [] [] 0 0) todo >>= flushOut st
+            finishOutput st current (outActive out)
+            pure out
+        )
+          `onException` (readIORef current >>= mapM_ (abandonOutput st))
 
-      -- Nothing in the keydir can reference an input any more: new writes only
-      -- ever land in the active file, so every reference either moved above or
-      -- was superseded while we worked.
+      -- The output is durable, or 'finishOutput' would have thrown, and the
+      -- inputs are left alone. Nothing in the keydir can reference an input any
+      -- more: new writes only ever land in the active file, so every reference
+      -- either moved above or was superseded while we worked.
       removeInputs st inputs
 
       pure
@@ -137,8 +151,8 @@ data Out = Out
 data Claim = Claim !ByteString !Loc !Loc
 
 -- | Copy one live record into the merge output.
-copyOne :: Store -> Out -> ByteString -> Loc -> Maybe ByteString -> IO Out
-copyOne st out0 k loc swept = do
+copyOne :: Store -> IORef (Maybe Active) -> Out -> ByteString -> Loc -> Maybe ByteString -> IO Out
+copyOne st current out0 k loc swept = do
   -- A sweep read that failed or came up short gets one careful retry on its
   -- own; that one is allowed to throw.
   bytes <- case swept of
@@ -156,7 +170,7 @@ copyOne st out0 k loc swept = do
               if needsRoll (outActive out0) (BS.length bytes)
                 then do
                   o <- flushOut st out0
-                  a <- rollMergeOutput st (outActive o)
+                  a <- rollMergeOutput st current (outActive o)
                   pure o {outActive = a}
                 else pure out0
             let ac = outActive out
@@ -172,7 +186,7 @@ copyOne st out0 k loc swept = do
                       , hintRecSize = locSize loc
                       }
                 newLoc = Loc (acFileId ac) off (locSize loc) (recTstamp r)
-            ac' <- appendHint ac {acOffset = off + fromIntegral (BS.length bytes)} hintBytes
+            ac' <- appendHint st ac {acOffset = off + fromIntegral (BS.length bytes)} hintBytes
             let out' =
                   out
                     { outActive = ac'
@@ -193,7 +207,7 @@ flushOut st out
   | otherwise = do
       let ac = outActive out
           fid = acFileId ac
-      appendBytes (acData ac) (BS.concat (reverse (outPendingBytes out)))
+      appendData st (acData ac) (BS.concat (reverse (outPendingBytes out)))
       -- Compare-on-location: install each new place only if nobody moved the key
       -- while we were copying it. A put that got there first wins, and the copy
       -- is dead on arrival.
@@ -212,14 +226,45 @@ mergeBlockSize = 256 * 1024
 
 -- | Roll the merge output to the next sub-sequence id at the same base, which
 -- keeps it sorting before the active file.
-rollMergeOutput :: Store -> Active -> IO Active
-rollMergeOutput st out = do
-  closeActive st out
+rollMergeOutput :: Store -> IORef (Maybe Active) -> Active -> IO Active
+rollMergeOutput st current out = do
+  finishOutput st current out
   let fid = acFileId out
       next = mkFileId (fileBase fid) (fileSub fid + 1)
-  out' <- openActive (stDir st) next
+  out' <- mask_ $ do
+    o <- openActive (stDir st) next
+    writeIORef current (Just o)
+    pure o
   bumpTotal st next 0
   pure out'
+
+-- | Finish a merge output file, throwing if it could not be made durable.
+--
+-- It is forgotten before it is closed: 'closeActive' closes its handles whatever
+-- happens, and 'abandonOutput' must not close them a second time.
+finishOutput :: Store -> IORef (Maybe Active) -> Active -> IO ()
+finishOutput st current out = do
+  failed <- mask_ $ do
+    writeIORef current Nothing
+    closeActive st out
+  mapM_ throwIO failed
+
+-- | Close a merge output after the merge failed.
+--
+-- Its records up to the last block written are real and some are already in the
+-- keydir, so the data file stays. The hint file goes, unfinished: entries are
+-- added to it ahead of the block their records are written in, so it may
+-- describe records that never reached the data file. Without a hint the next
+-- open scans the file, which stops cleanly at whatever the failure left at the
+-- end.
+abandonOutput :: Store -> Active -> IO ()
+abandonOutput st out = do
+  quietly (closeAppend (acHint out))
+  quietly (closeAppend (acData out))
+  _ <- removeOpen (hintPath (stDir st) (acFileId out))
+  pure ()
+  where
+    quietly act = void (try act :: IO (Either SomeException ()))
 
 -- | Retire the merged-away files.
 --

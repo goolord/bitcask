@@ -37,6 +37,29 @@
 -- reach the operating system as they are written, but survive a machine crash
 -- only once 'sync' has run. 'withBitcask' and 'close' sync on the way out. If
 -- you need more, set 'syncPolicy'.
+--
+-- == When a write fails
+--
+-- A 'put' or 'delete' that returns has happened. One that throws has not, with
+-- two exceptions, both of which also mark the store /broken/:
+--
+-- * The append failed and cutting the file back to where it was also failed.
+--   The failed write may be found after a reopen, or it may not.
+--
+-- * An @fsync@ failed, whether 'sync', or the one 'syncPolicy' asked for.
+--   The write that preceded it is visible, but whether it, or anything since
+--   the last good @fsync@, is on the disk is unknown.
+--
+-- A broken store refuses every later write, 'sync' and 'merge' with
+-- 'StoreBroken', rather than go on appending to a file whose end it can no
+-- longer vouch for; reads carry on working. 'close' it and 'open' it again to
+-- recover: reopening scans the file and repairs whatever the failure left at
+-- its end.
+--
+-- A write interrupted by an asynchronous exception — 'System.Timeout.timeout',
+-- 'Control.Concurrent.killThread' — either happened or did not, and never
+-- damages the store. A hint file that cannot be written never fails a write
+-- either; that file just goes without one, and is scanned on the next open.
 module Database.Bitcask
   ( -- * Handles
     Bitcask

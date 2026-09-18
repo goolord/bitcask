@@ -33,15 +33,23 @@ module Database.Bitcask.Internal.Store
   , openActive
   , closeActive
   , appendHint
+  , withActive
+  , markBroken
+  , appendData
   , bumpTotal
   , setDead
   , assertOpen
+
+    -- * Fault injection, for tests
+  , Fault (..)
+  , injectFault
   ) where
 
 import Control.Concurrent (ThreadId, killThread)
 import Control.Concurrent.MVar
-import Control.Exception (IOException, bracketOnError, throwIO, try)
-import Control.Monad (foldM, forM_, unless, when)
+import Control.Applicative ((<|>))
+import Control.Exception (IOException, SomeAsyncException, SomeException, bracketOnError, fromException, throwIO, toException, try)
+import Control.Monad (foldM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -49,6 +57,7 @@ import Data.IORef
 import qualified Data.List as L
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
+import Data.Either (isRight)
 import Data.Maybe (fromMaybe, isNothing)
 import qualified Data.Text as T
 import Data.Time.Clock.System (SystemTime (..), getSystemTime)
@@ -76,6 +85,8 @@ data Active = Active
   , acHintBuf :: ![ByteString]
   -- ^ hint entries not yet written, newest first; see 'appendHint'
   , acHintBufLen :: !Int
+  , acHintOk :: !Bool
+  -- ^ cleared if a hint write fails; the file then gets no hint, see 'flushHint'
   }
 
 -- | Read handles for the data files, by id.
@@ -110,6 +121,10 @@ data Store = Store
   , stThreads :: !(IORef [ThreadId])
   , stRetired :: !(IORef [ReadHandle])
   -- ^ handles for files merge has removed; see 'retireReader'
+  , stBroken :: !(IORef (Maybe String))
+  -- ^ why writes are refused, once they are; see 'markBroken'
+  , stFaults :: !(IORef [Fault])
+  -- ^ armed test faults; see 'Fault'
   }
 
 nowNanos :: IO Word64
@@ -154,6 +169,8 @@ openStore dir opts = do
     gate <- newMVar ()
     threads <- newIORef []
     retired <- newIORef []
+    broken <- newIORef Nothing
+    faults <- newIORef []
     active <-
       if readOnly opts
         then newMVar Nothing
@@ -177,6 +194,8 @@ openStore dir opts = do
         , stMergeGate = gate
         , stThreads = threads
         , stRetired = retired
+        , stBroken = broken
+        , stFaults = faults
         }
 
 -- | Bytes per file that the keydir does not reach.
@@ -287,6 +306,7 @@ openActive dir fid = do
       , acHintCount = 0
       , acHintBuf = []
       , acHintBufLen = 0
+      , acHintOk = True
       }
 
 -- | Add an entry to the active file's hint file.
@@ -297,47 +317,186 @@ openActive dir fid = do
 -- its trailer written, so there is nobody to see the difference; and a crash
 -- that loses the buffer loses nothing, because a hint file without its trailer is
 -- ignored in favour of scanning the data file.
-appendHint :: Active -> ByteString -> IO Active
-appendHint ac bytes = do
-  let ac' =
-        ac
-          { acHintCrc = crc32Update (acHintCrc ac) bytes
-          , acHintCount = acHintCount ac + 1
-          , acHintBuf = bytes : acHintBuf ac
-          , acHintBufLen = acHintBufLen ac + BS.length bytes
-          }
-  if acHintBufLen ac' >= hintBufferSize then flushHint ac' else pure ac'
+--
+-- Throws nothing but asynchronous exceptions: see 'flushHint'.
+appendHint :: Store -> Active -> ByteString -> IO Active
+appendHint st ac bytes
+  | not (acHintOk ac) = pure ac
+  | otherwise = do
+      let ac' =
+            ac
+              { acHintCrc = crc32Update (acHintCrc ac) bytes
+              , acHintCount = acHintCount ac + 1
+              , acHintBuf = bytes : acHintBuf ac
+              , acHintBufLen = acHintBufLen ac + BS.length bytes
+              }
+      if acHintBufLen ac' >= hintBufferSize then flushHint st ac' else pure ac'
 
 -- | Write out buffered hint entries.
-flushHint :: Active -> IO Active
-flushHint ac
-  | null (acHintBuf ac) = pure ac
+--
+-- A hint file is a cache, so a failure to write one must never fail the write
+-- that caused it. If a hint write fails the file is simply given up on: nothing
+-- more is buffered for it, it gets no trailer, and it is deleted when the data
+-- file is finished. The next open scans that data file instead.
+flushHint :: Store -> Active -> IO Active
+flushHint st ac
+  | not (acHintOk ac) || null (acHintBuf ac) = pure ac
   | otherwise = do
-      appendBytes (acHint ac) (BS.concat (reverse (acHintBuf ac)))
-      pure ac {acHintBuf = [], acHintBufLen = 0}
+      r <- try $ do
+        injected <- fault st FaultHintWrite
+        when injected $ throwIO (userError "injected fault: hint write")
+        appendBytes (acHint ac) (BS.concat (reverse (acHintBuf ac)))
+      case r of
+        Right () -> pure ac {acHintBuf = [], acHintBufLen = 0}
+        Left (e :: SomeException)
+          -- Only a failed write costs the hint. An asynchronous exception —
+          -- a merge thread being killed by 'closeStore', say — must go on
+          -- being delivered, or the thread would carry on as if nothing had
+          -- happened.
+          | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
+          | otherwise -> pure ac {acHintBuf = [], acHintBufLen = 0, acHintOk = False}
 
 hintBufferSize :: Int
 hintBufferSize = 64 * 1024
 
--- | Finish the active file: cap its hint file with the trailer that makes it
--- usable, sync the data, and close both.
-closeActive :: Store -> Active -> IO ()
+-- | Finish a data file: sync it, cap its hint file with the trailer that makes
+-- the hint usable, and close both.
+--
+-- This always closes both handles, even when something fails, so that nothing
+-- ever tries to use or close them again. It reports a failure to make the data
+-- durable rather than throwing it, having already marked the store broken; a
+-- failure to finish the hint only costs the hint.
+--
+-- The data is synced before the hint trailer is written, and a store that is
+-- broken gets no trailer at all. A hint describes only the writes that
+-- succeeded, so on a broken store it would be accurate — but it would also make
+-- the next open trust the file without scanning it, and the scan is what finds
+-- and repairs whatever a failed write left at the end.
+closeActive :: Store -> Active -> IO (Maybe SomeException)
 closeActive st ac0 = do
-  ac <- flushHint ac0
-  appendBytes (acHint ac) (encodeHintTrailer (acHintCount ac) (acHintCrc ac))
-  syncFile (acHint ac)
-  syncFile (acData ac)
-  closeAppend (acHint ac)
-  closeAppend (acData ac)
-  syncDir (stDir st)
+  ac <- flushHint st ac0
+  synced <- try (syncData st (acData ac))
+  forM_ (leftToMaybe synced) $ \e ->
+    markBroken st ("sync of " <> dataPath (stDir st) (acFileId ac) <> " failed: " <> show e)
+  healthy <- isNothing <$> readIORef (stBroken st)
+  hinted <-
+    if acHintOk ac && healthy
+      then isRight <$> (try (do
+        appendBytes (acHint ac) (encodeHintTrailer (acHintCount ac) (acHintCrc ac))
+        syncFile (acHint ac)) :: IO (Either SomeException ()))
+      else pure False
+  quietly (closeAppend (acHint ac))
+  quietly (closeAppend (acData ac))
+  -- A hint without a trailer is ignored on open anyway; removing it just keeps
+  -- the directory honest.
+  unless hinted $ void (removeOpen (hintPath (stDir st) (acFileId ac)))
+  -- The directory entry for the new file is part of its durability too.
+  dirSynced <- try (syncDir (stDir st))
+  forM_ (leftToMaybe dirSynced) $ \e ->
+    markBroken st ("sync of directory " <> stDir st <> " failed: " <> show e)
+  pure (leftToMaybe synced <|> leftToMaybe dirSynced)
+  where
+    quietly act = void (try act :: IO (Either SomeException ()))
 
 -- | Roll to a fresh active file.
-rollActive :: Store -> Active -> IO Active
+--
+-- The new file is opened /before/ the old one is closed, so that failing to
+-- open it — no space, no file descriptors — leaves the old file active and the
+-- store perfectly usable. Returns the file to carry on with, and the error if
+-- there was one.
+rollActive :: Store -> Active -> IO (Active, Maybe SomeException)
 rollActive st ac = do
-  closeActive st ac
-  ac' <- openActive (stDir st) (mkFileId (fileBase (acFileId ac) + 1) 0)
-  bumpTotal st (acFileId ac') 0
-  pure ac'
+  opened <- try (openActive (stDir st) (mkFileId (fileBase (acFileId ac) + 1) 0))
+  case opened of
+    Left e -> pure (ac, Just e)
+    Right ac' -> do
+      bumpTotal st (acFileId ac') 0
+      closed <- closeActive st ac
+      pure (ac', closed)
+
+-- ---------------------------------------------------------------------------
+-- Write safety
+
+-- | Run one step of the write path against the active file.
+--
+-- The step runs with asynchronous exceptions masked. Without that, a
+-- 'System.Timeout.timeout' or 'Control.Concurrent.killThread' landing between
+-- an append and the bookkeeping after it would put the old 'Active' back while
+-- the bytes stayed on disk, and every later write would record its location at
+-- the wrong offset — silently, since the writes themselves would succeed.
+--
+-- The step reports failure by returning it, alongside the 'Active' that is now
+-- true, because on failure the file may still have changed (it may have rolled)
+-- and the MVar must hold what is actually there. A step that throws anyway has
+-- hit something unforeseen, so the store is marked broken rather than trusted.
+withActive :: Store -> (Active -> IO (Active, Either SomeException a)) -> IO a
+withActive st step = do
+  r <- modifyMVarMasked (stActive st) $ \case
+    Nothing -> pure (Nothing, Left (toException WriteToReadOnly))
+    Just ac -> do
+      broken <- readIORef (stBroken st)
+      case broken of
+        Just why -> pure (Just ac, Left (toException (StoreBroken why)))
+        Nothing -> do
+          res <- try (step ac)
+          case res of
+            Right (ac', out) -> pure (Just ac', out)
+            Left e -> do
+              markBroken st ("unexpected failure in the write path: " <> show e)
+              pure (Just ac, Left e)
+  either throwIO pure r
+
+-- | Refuse all further writes, for the given reason. The first reason sticks.
+markBroken :: Store -> String -> IO ()
+markBroken st why = atomicModifyIORef' (stBroken st) (\b -> (b <|> Just why, ()))
+
+-- | Append to a data file, in a way the tests can make fail: an armed
+-- 'FaultDataWrite' writes half the bytes and then throws, which is the worst a
+-- real failed write can do.
+appendData :: Store -> AppendHandle -> ByteString -> IO ()
+appendData st h bytes = do
+  injected <- fault st FaultDataWrite
+  if injected
+    then do
+      appendBytes h (BS.take (BS.length bytes `div` 2) bytes)
+      throwIO (userError "injected fault: data write")
+    else appendBytes h bytes
+
+-- | @fsync@ a data file, in a way the tests can make fail.
+syncData :: Store -> AppendHandle -> IO ()
+syncData st h = do
+  injected <- fault st FaultSync
+  when injected $ throwIO (userError "injected fault: sync")
+  syncFile h
+
+-- | Failures the test suite can arm, to reach the paths that a real disk only
+-- takes when it is full or failing. Each fires once, at its next opportunity.
+data Fault
+  = -- | an append to the active data file writes half the record, then fails
+    FaultDataWrite
+  | -- | undoing a failed append fails
+    FaultUndo
+  | -- | an @fsync@ of a data file fails
+    FaultSync
+  | -- | writing out buffered hint entries fails
+    FaultHintWrite
+  deriving stock (Eq, Show)
+
+-- | Arm a fault. For tests only.
+injectFault :: Store -> Fault -> IO ()
+injectFault st f = atomicModifyIORef' (stFaults st) (\fs -> (f : fs, ()))
+
+-- | Whether a fault is armed, disarming it if so. Costs one read when none is.
+fault :: Store -> Fault -> IO Bool
+fault st f = do
+  armed <- readIORef (stFaults st)
+  if null armed
+    then pure False
+    else atomicModifyIORef' (stFaults st) $ \fs ->
+      if f `elem` fs then (L.delete f fs, True) else (fs, False)
+
+leftToMaybe :: Either a b -> Maybe a
+leftToMaybe = either Just (const Nothing)
 
 -- ---------------------------------------------------------------------------
 -- Readers
@@ -499,6 +658,23 @@ putRaw st k v = do
 deleteRaw :: Store -> ByteString -> IO ()
 deleteRaw st k = appendRecord st k Nothing
 
+-- | Append one record and point the keydir at it.
+--
+-- What a caller can rely on, however this ends:
+--
+-- * If it returns, the record is in the file and visible to readers.
+--
+-- * If the append fails, the file is cut back to where it was and the call
+--   throws: the write did not happen, and the store carries on.
+--
+-- * If the append fails and the file cannot be cut back, or an @fsync@ that the
+--   'SyncPolicy' asked for fails, the call throws and the store is marked
+--   broken: every later write fails with 'StoreBroken' until the store is
+--   reopened. A failed @fsync@ comes after the record was written and indexed,
+--   so that record is visible now and may or may not survive a reopen.
+--
+-- * If it is interrupted by an asynchronous exception, it either happened or
+--   did not; see 'withActive'.
 appendRecord :: Store -> ByteString -> Maybe ByteString -> IO ()
 appendRecord st k mv = do
   assertOpen st
@@ -507,47 +683,71 @@ appendRecord st k mv = do
   ts <- nowNanos
   let bytes = encodeRecord ts k mv
       n = BS.length bytes
-  modifyMVar_ (stActive st) $ \case
-    Nothing -> throwIO WriteToReadOnly
-    Just ac0 -> do
-      ac <- if needsRoll ac0 n then rollActive st ac0 else pure ac0
-      let off = acOffset ac
-      appendBytes (acData ac) bytes
-      let hintBytes =
-            encodeHintEntry
-              HintEntry
-                { hintTstamp = ts
-                , hintTombstone = isNothing mv
-                , hintKey = k
-                , hintValSize = maybe 0 (fromIntegral . BS.length) mv
-                , hintPos = off
-                , hintRecSize = fromIntegral n
-                }
-      -- Before the keydir update: a hint flush that throws must leave the put
-      -- invisible, as a failed put should be.
-      ac' <- appendHint ac {acOffset = off + fromIntegral n} hintBytes
-      let loc = Loc (acFileId ac) off (fromIntegral n) ts
-      old <- atomicModifyIORef' (stKeydir st) $
-        KD.replace k (if isNothing mv then Nothing else Just loc)
-      forM_ old $ \o -> bumpDead st (locFileId o) (fromIntegral (locSize o))
-      -- A tombstone is never reachable from the keydir, so it is dead the
-      -- instant it is written.
-      when (isNothing mv) $ bumpDead st (acFileId ac) (fromIntegral n)
-      bumpTotal st (acFileId ac) (fromIntegral n)
-      maybeSync st ac'
-      pure (Just ac')
+  withActive st $ \ac0 -> do
+    (ac, rollErr) <-
+      if needsRoll ac0 n then rollActive st ac0 else pure (ac0, Nothing)
+    case rollErr of
+      Just e -> pure (ac, Left e)
+      Nothing -> do
+        let off = acOffset ac
+        written <- try (appendData st (acData ac) bytes)
+        case written of
+          Left e -> do
+            undoWrite ac e
+            pure (ac, Left e)
+          Right () -> do
+            let hintBytes =
+                  encodeHintEntry
+                    HintEntry
+                      { hintTstamp = ts
+                      , hintTombstone = isNothing mv
+                      , hintKey = k
+                      , hintValSize = maybe 0 (fromIntegral . BS.length) mv
+                      , hintPos = off
+                      , hintRecSize = fromIntegral n
+                      }
+            ac' <- appendHint st ac {acOffset = off + fromIntegral n} hintBytes
+            let loc = Loc (acFileId ac) off (fromIntegral n) ts
+            old <- atomicModifyIORef' (stKeydir st) $
+              KD.replace k (if isNothing mv then Nothing else Just loc)
+            forM_ old $ \o -> bumpDead st (locFileId o) (fromIntegral (locSize o))
+            -- A tombstone is never reachable from the keydir, so it is dead the
+            -- instant it is written.
+            when (isNothing mv) $ bumpDead st (acFileId ac) (fromIntegral n)
+            bumpTotal st (acFileId ac) (fromIntegral n)
+            synced <- try (maybeSync st ac')
+            forM_ (leftToMaybe synced) $ \e ->
+              markBroken st ("sync of " <> dataPath (stDir st) (acFileId ac) <> " failed: " <> show e)
+            pure (ac', synced)
   where
     needsRoll ac n =
       acOffset ac > 0 && acOffset ac + fromIntegral n > maxFileSize (stOpts st)
+
+    -- Some of the record may have reached the file. Cut it off, so that the
+    -- file ends where 'acOffset' says it does.
+    undoWrite ac (e :: SomeException) = do
+      undone <- try $ do
+        injected <- fault st FaultUndo
+        when injected $ throwIO (userError "injected fault: undo")
+        truncateAppend (acData ac) (acOffset ac)
+      forM_ (leftToMaybe undone) $ \(e2 :: SomeException) ->
+        markBroken st $
+          "a write to "
+            <> dataPath (stDir st) (acFileId ac)
+            <> " failed ("
+            <> show e
+            <> ") and could not be undone ("
+            <> show e2
+            <> ")"
 
 maybeSync :: Store -> Active -> IO ()
 maybeSync st ac = case syncPolicy (stOpts st) of
   SyncNever -> pure ()
   SyncEveryMicros _ -> pure () -- handled by a background thread
-  SyncOnPut -> syncFile (acData ac)
+  SyncOnPut -> syncData st (acData ac)
   SyncEvery n -> do
     c <- atomicModifyIORef' (stWrites st) (\w -> let w' = w + 1 in (w', w'))
-    when (n > 0 && c `mod` n == 0) $ syncFile (acData ac)
+    when (n > 0 && c `mod` n == 0) $ syncData st (acData ac)
 
 bumpDead :: Store -> FileId -> Word64 -> IO ()
 bumpDead st fid n = atomicModifyIORef' (stDead st) (\m -> (M.insertWith (+) fid n m, ()))
@@ -569,7 +769,16 @@ syncStore st = do
     -- Only the data file. The hint file is not worth an fsync of its own: until
     -- its trailer is written at close it is ignored on open anyway, and
     -- 'closeActive' syncs it then.
-    Just ac -> syncFile (acData ac)
+    Just ac -> do
+      -- A sync on a broken store cannot promise anything, so it does not
+      -- pretend to.
+      readIORef (stBroken st) >>= mapM_ (throwIO . StoreBroken)
+      synced <- try (syncData st (acData ac))
+      case synced of
+        Right () -> pure ()
+        Left (e :: SomeException) -> do
+          markBroken st ("sync of " <> dataPath (stDir st) (acFileId ac) <> " failed: " <> show e)
+          throwIO e
 
 statsStore :: Store -> IO Stats
 statsStore st = do
@@ -584,17 +793,21 @@ statsStore st = do
       , statsTotalBytes = sum (M.elems totals)
       }
 
+-- | Finish the active file, stop background work and release every handle and
+-- the lock. Everything is released even if finishing the active file fails;
+-- that failure is thrown afterwards.
 closeStore :: Store -> IO ()
 closeStore st = do
   already <- atomicModifyIORef' (stClosed st) (\c -> (True, c))
   unless already $ do
     readIORef (stThreads st) >>= mapM_ killThread
-    modifyMVar_ (stActive st) $ \case
-      Nothing -> pure Nothing
-      Just ac -> closeActive st ac >> pure Nothing
+    failed <- modifyMVarMasked (stActive st) $ \case
+      Nothing -> pure (Nothing, Nothing)
+      Just ac -> (,) Nothing <$> closeActive st ac
     let rd = stReaders st
     withMVar (rdLock rd) $ \() ->
       atomicModifyIORef' (rdMap rd) (\m -> (M.empty, m)) >>= mapM_ closeRead . M.elems
     readIORef (stRetired st) >>= mapM_ closeRead
     writeIORef (stRetired st) []
     releaseLock (stLock st)
+    mapM_ throwIO failed

@@ -58,6 +58,14 @@ the operating system as they are written, but survive a machine crash only once
 `sync` has run; `withBitcask` and `close` sync on the way out. Set `syncPolicy`
 if you need more.
 
+A write that returns has happened; a write that throws has not, and a write cut
+short by `timeout` or `killThread` either happened or did not. The exceptions are
+failures that leave the end of the data file in doubt — a failed `fsync`, or a
+failed append that could not be undone. Those mark the store broken: later
+writes fail with `StoreBroken` until it is closed and reopened, which repairs the
+file. Reads keep working throughout. The haddock for `Database.Bitcask` has the
+details.
+
 ## Build
 
 ```

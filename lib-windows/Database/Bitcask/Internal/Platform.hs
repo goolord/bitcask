@@ -33,6 +33,7 @@ module Database.Bitcask.Internal.Platform
   , appendBytes
   , syncFile
   , closeAppend
+  , truncateAppend
   , syncDir
   , truncateAt
   , LockMode (..)
@@ -44,6 +45,7 @@ module Database.Bitcask.Internal.Platform
 
 import Control.Concurrent (getNumCapabilities, myThreadId, threadCapability)
 import Control.Exception (IOException, bracket, onException, try)
+import Control.Monad (unless)
 import Data.Bits (shiftR, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -253,6 +255,24 @@ syncFile (AppendHandle h) = flushFileBuffers h
 
 closeAppend :: AppendHandle -> IO ()
 closeAppend (AppendHandle h) = closeHandle h
+
+-- | Cut the file back to @n@ bytes, undoing an append that failed part-way.
+--
+-- @SetEndOfFile@ truncates at the file pointer, so the pointer is moved there
+-- first. Nothing else uses the pointer: 'appendBytes' always writes at the
+-- end of the file, wherever that now is.
+truncateAppend :: AppendHandle -> Word64 -> IO ()
+truncateAppend (AppendHandle h) n = do
+  moved <- c_SetFilePointerEx h (fromIntegral n) nullPtr 0 -- FILE_BEGIN
+  unless moved $ failWith "SetFilePointerEx" =<< getLastError
+  cut <- c_SetEndOfFile h
+  unless cut $ failWith "SetEndOfFile" =<< getLastError
+
+foreign import ccall unsafe "windows.h SetFilePointerEx"
+  c_SetFilePointerEx :: HANDLE -> Int64 -> Ptr Int64 -> DWORD -> IO BOOL
+
+foreign import ccall unsafe "windows.h SetEndOfFile"
+  c_SetEndOfFile :: HANDLE -> IO BOOL
 
 -- | No-op: see the module header.
 syncDir :: FilePath -> IO ()

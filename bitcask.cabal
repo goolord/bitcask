@@ -96,6 +96,7 @@ test-suite bitcask-test
         Test.Bitcask.Model
         Test.Bitcask.Record
         Test.Bitcask.Util
+        Test.Bitcask.WriteSafety
     build-depends:
         base,
         bitcask,
