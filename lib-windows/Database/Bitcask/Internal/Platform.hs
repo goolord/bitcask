@@ -6,21 +6,19 @@
 -- Three notes on how this differs, because the differences are the whole reason
 -- this module exists:
 --
--- * __Positional reads__ use a small pool of handles guarded by an 'MVar', which
---   is the fallback @DESIGN.md@ §2.1 describes rather than its first choice.
---   Windows has no @pread@; @ReadFile@ takes an offset through an @OVERLAPPED@
---   structure, but on a handle opened without @FILE_FLAG_OVERLAPPED@ it also
---   moves the shared file pointer, so concurrent positional reads on one handle
---   race. Doing it properly means overlapped handles and a per-call @OVERLAPPED@
---   with its own event, which is worth doing and is not worth doing blind — the
---   pool is correct, portable and costs only some contention under many
---   concurrent readers.
+-- * __Positional reads__ go through a raw Win32 @HANDLE@ and @ReadFile@ with
+--   the offset in an @OVERLAPPED@ structure. Windows has no @pread@, but that is
+--   its equivalent: each call names its own offset, so nothing depends on the
+--   handle's shared file pointer. A GHC 'Handle' is not an option here — see
+--   'ReadHandle'.
 --
--- * __Deleting a merged-away file__ that a reader still holds open fails here,
---   where POSIX allows it. 'removeOpen' therefore reports 'False' instead of
---   throwing, and the caller records the file in @bitcask.pending@ and sweeps it
---   at the next open. (Opening every read handle with @FILE_SHARE_DELETE@ would
---   give POSIX semantics and is the natural follow-up to the overlapped work.)
+-- * __Deleting a merged-away file__ that a reader still holds open works, as on
+--   POSIX, because every read handle is opened with @FILE_SHARE_DELETE@. If a
+--   delete fails anyway (another process has the file open, say), 'removeOpen'
+--   reports 'False' instead of throwing, and the caller records the file in
+--   @bitcask.pending@ and sweeps it at the next open. That fallback is slow —
+--   @removeFile@ retries a sharing violation for about two seconds before giving
+--   up — which is why it must not be the common path.
 --
 -- * __There is no directory sync__, and none is needed: @FlushFileBuffers@ on the
 --   file handle is the durability primitive, so 'syncDir' is a no-op.
@@ -44,64 +42,101 @@ module Database.Bitcask.Internal.Platform
   , removeOpen
   ) where
 
-import Control.Concurrent.MVar
 import Control.Exception (IOException, bracket, try)
-import Data.Bits ((.|.))
+import Data.Bits (shiftR, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Word (Word32, Word64)
+import qualified Data.ByteString.Internal as BSI
+import Data.Word (Word32, Word64, Word8)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Marshal.Utils (fillBytes)
+import Foreign.Ptr (Ptr, nullPtr, plusPtr)
+import Foreign.Storable (peek, pokeByteOff, sizeOf)
 import System.Directory (removeFile)
 import System.IO
 import System.Win32.File
   ( closeHandle
   , createFile
   , fILE_ATTRIBUTE_NORMAL
+  , fILE_SHARE_DELETE
+  , fILE_SHARE_READ
+  , fILE_SHARE_WRITE
   , flushFileBuffers
   , gENERIC_READ
   , gENERIC_WRITE
   , oPEN_ALWAYS
+  , oPEN_EXISTING
   )
-import System.Win32.Types (HANDLE, withHandleToHANDLE)
+import System.Win32.Types (BOOL, DWORD, HANDLE, failWith, getLastError, withHandleToHANDLE)
 
 platformName :: String
 platformName = "windows"
 
--- | How many read handles to keep open per data file.
-poolMax :: Int
-poolMax = 8
-
--- | A data file opened for reading: a path plus a pool of handles. Safe to share
--- across threads.
-data ReadHandle = ReadHandle !FilePath !(MVar [Handle])
+-- | A data file opened for reading. Safe to share across threads.
+--
+-- This is a raw Win32 @HANDLE@, not a GHC 'Handle', on purpose. GHC enforces
+-- its own single-writer/multi-reader lock per file within a process, so a
+-- read-mode 'Handle' on the active file is refused ("resource busy") while its
+-- append handle is open, and every 'get' of a freshly written key would fail.
+data ReadHandle = ReadHandle !FilePath !HANDLE
 
 openRead :: FilePath -> IO ReadHandle
-openRead p = do
-  h <- openBinaryFile p ReadMode
-  ReadHandle p <$> newMVar [h]
+openRead p =
+  ReadHandle p
+    <$> createFile
+      p
+      gENERIC_READ
+      (fILE_SHARE_READ .|. fILE_SHARE_WRITE .|. fILE_SHARE_DELETE)
+      Nothing
+      oPEN_EXISTING
+      fILE_ATTRIBUTE_NORMAL
+      Nothing
 
 -- | Read @n@ bytes at an absolute offset. Returns fewer bytes at end of file.
+--
+-- Every @ReadFile@ carries its own offset in an @OVERLAPPED@, so no call relies
+-- on the handle's shared file pointer and concurrent reads on one handle do not
+-- interfere with each other.
 preadAt :: ReadHandle -> Word64 -> Int -> IO ByteString
-preadAt rh@(ReadHandle _ _) off n
+preadAt (ReadHandle _ h) off n
   | n <= 0 = pure BS.empty
-  | otherwise = bracket (acquire rh) (release rh) $ \h -> do
-      hSeek h AbsoluteSeek (fromIntegral off)
-      BS.hGet h n
+  | otherwise = BSI.createUptoN n $ \buf -> go buf 0
+  where
+    go buf got
+      | got >= n = pure got
+      | otherwise = do
+          r <- readChunkAt h (off + fromIntegral got) (buf `plusPtr` got) (n - got)
+          if r == 0 then pure got else go buf (got + r)
 
-acquire :: ReadHandle -> IO Handle
-acquire (ReadHandle p pool) = do
-  taken <- modifyMVar pool $ \hs -> case hs of
-    (h : rest) -> pure (rest, Just h)
-    [] -> pure ([], Nothing)
-  maybe (openBinaryFile p ReadMode) pure taken
+-- | One @ReadFile@ at an offset. @0@ means end of file.
+readChunkAt :: HANDLE -> Word64 -> Ptr Word8 -> Int -> IO Int
+readChunkAt h off buf n =
+  allocaBytes ovlSize $ \ovl -> alloca $ \pRead -> do
+    fillBytes ovl 0 ovlSize
+    pokeByteOff ovl offsetAt (fromIntegral off :: DWORD)
+    pokeByteOff ovl (offsetAt + 4) (fromIntegral (off `shiftR` 32) :: DWORD)
+    ok <- c_ReadFile h buf (fromIntegral (min n maxChunk)) pRead ovl
+    if ok
+      then fromIntegral <$> peek pRead
+      else do
+        err <- getLastError
+        -- A synchronous read that starts at or past the end fails with
+        -- ERROR_HANDLE_EOF rather than reading zero bytes.
+        if err == eRROR_HANDLE_EOF then pure 0 else failWith "ReadFile" err
+  where
+    -- OVERLAPPED is { ULONG_PTR Internal, InternalHigh; DWORD Offset, OffsetHigh;
+    -- HANDLE hEvent }. Win32 exports the type but no Storable instance.
+    ptrSize = sizeOf nullPtr
+    offsetAt = 2 * ptrSize
+    ovlSize = 3 * ptrSize + 8
+    maxChunk = 0x40000000
+    eRROR_HANDLE_EOF = 38
 
-release :: ReadHandle -> Handle -> IO ()
-release (ReadHandle _ pool) h = modifyMVar_ pool $ \hs ->
-  if length hs >= poolMax
-    then hClose h >> pure hs
-    else pure (h : hs)
+foreign import ccall safe "windows.h ReadFile"
+  c_ReadFile :: HANDLE -> Ptr Word8 -> DWORD -> Ptr DWORD -> Ptr () -> IO BOOL
 
 closeRead :: ReadHandle -> IO ()
-closeRead (ReadHandle _ pool) = modifyMVar_ pool $ \hs -> mapM_ hClose hs >> pure []
+closeRead (ReadHandle _ h) = closeHandle h
 
 -- | A data file opened for appending. All writes are serialised by the caller.
 newtype AppendHandle = AppendHandle Handle
