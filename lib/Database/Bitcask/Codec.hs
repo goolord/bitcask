@@ -10,11 +10,10 @@ module Database.Bitcask.Codec
 
     -- * Deriving a codec from a library you already use
     -- $deriving
-  , AsBinary (..)
+  , AsSerialize (..)
   ) where
 
-import qualified Data.Binary as Binary
-import qualified Data.Binary.Put as Binary
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
@@ -22,6 +21,7 @@ import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
 import Data.Bits (Bits, shiftL)
 import Data.Int (Int32, Int64)
+import qualified Data.Serialize as Cereal
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
@@ -61,32 +61,35 @@ encodeStrict = BL.toStrict . BB.toLazyByteString . toBytes
 -- $deriving
 --
 -- Rather than inventing another serialisation format, adapt one you already
--- have. @binary@ ships with GHC, so 'AsBinary' is free:
+-- have. 'AsSerialize' covers @cereal@:
 --
--- > data User = User { userName :: Text, userAge :: Int }
+-- > data User = User { userName :: String, userAge :: Int }
 -- >   deriving stock (Show, Generic)
--- >   deriving anyclass (Binary)
--- >   deriving Codec via (AsBinary User)
+-- >   deriving anyclass (Serialize)
+-- >   deriving Codec via (AsSerialize User)
 --
--- Adapters for @cereal@, @store@ or @serialise@ are three lines each and belong
+-- Adapters for @binary@, @store@ or @serialise@ are a few lines each and belong
 -- in your project rather than behind a cabal flag on this one:
 --
--- > newtype AsCereal a = AsCereal a
--- > instance Serialize a => Codec (AsCereal a) where
--- >   toBytes (AsCereal a) = byteString (Cereal.encode a)
--- >   fromBytes bs = AsCereal <$> Cereal.decode bs
+-- > newtype AsBinary a = AsBinary a
+-- > instance Binary a => Codec (AsBinary a) where
+-- >   toBytes (AsBinary a) = Binary.execPut (Binary.put a)
+-- >   fromBytes bs = case Binary.decodeOrFail (BL.fromStrict bs) of
+-- >     Right (rest, _, a) | BL.null rest -> Right (AsBinary a)
+-- >     _ -> Left "AsBinary: decode failed"
 
--- | Derive a 'Codec' from a @binary@ 'Binary.Binary' instance, via
+-- | Derive a 'Codec' from a @cereal@ 'Cereal.Serialize' instance, via
 -- @DerivingVia@.
-newtype AsBinary a = AsBinary {unAsBinary :: a}
+newtype AsSerialize a = AsSerialize {unAsSerialize :: a}
 
-instance (Binary.Binary a) => Codec (AsBinary a) where
-  toBytes (AsBinary a) = Binary.execPut (Binary.put a)
-  fromBytes bs = case Binary.decodeOrFail (BL.fromStrict bs) of
-    Left (_, _, err) -> Left err
-    Right (rest, _, a)
-      | BL.null rest -> Right (AsBinary a)
-      | otherwise -> Left "AsBinary: trailing bytes after a complete value"
+instance (Cereal.Serialize a) => Codec (AsSerialize a) where
+  toBytes (AsSerialize a) = BB.byteString (Cereal.encode a)
+  -- Not 'Cereal.decode': it ignores whatever follows a complete value.
+  fromBytes = fmap AsSerialize . Cereal.runGet (Cereal.get <* end)
+    where
+      end = do
+        done <- Cereal.isEmpty
+        unless done $ fail "AsSerialize: trailing bytes after a complete value"
 
 -- Every instance below rejects trailing bytes. A decoder that ignores them would
 -- break the roundtrip law in the other direction and, for keys, would make two

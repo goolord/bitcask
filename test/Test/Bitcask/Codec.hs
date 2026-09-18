@@ -2,9 +2,8 @@ module Test.Bitcask.Codec (tests) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Binary (Binary)
+import Data.Serialize (Serialize)
 import Data.Int (Int64)
-import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Word (Word32, Word64)
 import GHC.Generics (Generic)
@@ -29,7 +28,7 @@ tests =
         , testProperty "Word64" $ \(n :: Word64) -> law n
         , testProperty "Bool" $ \(b :: Bool) -> law b
         , testProperty "()" $ law ()
-        , testProperty "AsBinary" $ \n s -> lawVia (User (T.pack s) n)
+        , testProperty "AsSerialize" $ \n s -> lawVia (User s n)
         ]
     , -- The roundtrip law is what forces 'toBytes' to be injective, which is the
       -- property keys actually need: two keys that encoded alike would silently
@@ -52,14 +51,14 @@ tests =
 
     lawVia :: User -> Property
     lawVia x =
-      (unAsBinary <$> fromBytes (encodeStrict (AsBinary x))) === Right x
+      (unAsSerialize <$> fromBytes (encodeStrict (AsSerialize x))) === Right x
 
-data User = User {userName :: Text, userAge :: Int}
+data User = User {userName :: String, userAge :: Int}
   deriving stock (Eq, Show, Generic)
-  deriving anyclass (Binary)
+  deriving anyclass (Serialize)
 
-instance Eq (AsBinary User) where
-  AsBinary a == AsBinary b = a == b
+instance Eq (AsSerialize User) where
+  AsSerialize a == AsSerialize b = a == b
 
-instance Show (AsBinary User) where
-  show (AsBinary a) = show a
+instance Show (AsSerialize User) where
+  show (AsSerialize a) = show a

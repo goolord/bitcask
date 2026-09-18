@@ -14,14 +14,14 @@ hundred million small keys is not a Bitcask.
 {-# LANGUAGE DerivingVia, DeriveAnyClass, DeriveGeneric, TypeApplications #-}
 
 import Database.Bitcask
-import Data.Binary (Binary)
+import Data.Serialize (Serialize)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 
-data User = User { userName :: Text, userAge :: Int }
+data User = User { userName :: String, userAge :: Int }
   deriving stock (Show, Generic)
-  deriving anyclass (Binary)
-  deriving Codec via (AsBinary User)
+  deriving anyclass (Serialize)
+  deriving Codec via (AsSerialize User)
 
 main :: IO ()
 main = withBitcask @Text @User "users" defaultOptions $ \bc -> do
@@ -30,8 +30,8 @@ main = withBitcask @Text @User "users" defaultOptions $ \bc -> do
 ```
 
 Keys and values are any types with a `Codec` instance. Derive one from a
-serialisation library you already use — `AsBinary` is built in because `binary`
-ships with GHC — or write the two methods yourself. `Database.Bitcask.Raw` is the
+serialisation library you already use — `AsSerialize` is built in for `cereal`
+— or write the two methods yourself. `Database.Bitcask.Raw` is the
 same store at plain `ByteString`s.
 
 ## What it does

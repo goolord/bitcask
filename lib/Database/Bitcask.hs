@@ -11,14 +11,14 @@
 --
 -- > {-# LANGUAGE DerivingVia, DeriveAnyClass, DeriveGeneric, TypeApplications #-}
 -- > import Database.Bitcask
--- > import Data.Binary (Binary)
+-- > import Data.Serialize (Serialize)
 -- > import Data.Text (Text)
 -- > import GHC.Generics (Generic)
 -- >
--- > data User = User { userName :: Text, userAge :: Int }
+-- > data User = User { userName :: String, userAge :: Int }
 -- >   deriving stock (Show, Generic)
--- >   deriving anyclass (Binary)
--- >   deriving Codec via (AsBinary User)
+-- >   deriving anyclass (Serialize)
+-- >   deriving Codec via (AsSerialize User)
 -- >
 -- > main :: IO ()
 -- > main = withBitcask @Text @User "users" defaultOptions $ \bc -> do
@@ -70,7 +70,7 @@ module Database.Bitcask
     -- * Encoding
   , Codec (..)
   , encodeStrict
-  , AsBinary (..)
+  , AsSerialize (..)
 
     -- * Errors and metadata
   , BitcaskError (..)
