@@ -11,9 +11,9 @@ module Database.Bitcask.Internal.CRC32
   , crc32Update
   ) where
 
-import Data.Array.Unboxed (UArray, listArray, (!))
 import Data.Bits (complement, shiftR, xor, (.&.))
 import qualified Data.ByteString as BS
+import Data.Primitive.PrimArray (PrimArray, indexPrimArray, primArrayFromListN)
 import Data.Word (Word32, Word8)
 
 -- | CRC-32 of a byte string. @'crc32' ""@ is @0@.
@@ -26,11 +26,11 @@ crc32Update :: Word32 -> BS.ByteString -> Word32
 crc32Update seed = complement . BS.foldl' step (complement seed)
   where
     step :: Word32 -> Word8 -> Word32
-    step c b = (table ! fromIntegral ((c `xor` fromIntegral b) .&. 0xFF)) `xor` (c `shiftR` 8)
+    step c b = indexPrimArray table (fromIntegral ((c `xor` fromIntegral b) .&. 0xFF)) `xor` (c `shiftR` 8)
 {-# INLINE crc32Update #-}
 
-table :: UArray Word8 Word32
-table = listArray (0, 255) [entry (fromIntegral n) | n <- [0 :: Int .. 255]]
+table :: PrimArray Word32
+table = primArrayFromListN 256 [entry (fromIntegral n) | n <- [0 :: Int .. 255]]
   where
     entry :: Word32 -> Word32
     entry = go (8 :: Int)
