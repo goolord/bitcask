@@ -66,6 +66,66 @@ $ cabal test
 $ cabal haddock --open
 ```
 
+## Benchmarks
+
+`bitcask-bench` times the pure codecs (CRC, record and hint encoding) and the
+store operations (`put`, `get`, `fold`, `open`, `merge`) against a real store in
+a temporary directory. Nothing in it syncs, so it measures the library and the
+OS page cache, not the disk.
+
+```
+$ cabal bench bitcask-bench
+```
+
+To check a change for regressions, save a baseline first and compare against it;
+`--fail-if-slower` turns a slowdown into a failing exit code:
+
+```
+$ cabal bench bitcask-bench --benchmark-options='--csv before.csv'
+$ # ... make the change ...
+$ cabal bench bitcask-bench --benchmark-options='--baseline before.csv --fail-if-slower 10'
+```
+
+`-p` selects benchmarks by pattern, e.g. `--benchmark-options='-p /get/'`.
+
+## Profiling
+
+`bitcask-workload` runs one realistic session end to end: a bulk load, random
+reads from one and then several threads, overwrites, a fold, a merge, and two
+reopens (from hint files, then by scanning the data files). It prints the wall
+time and throughput of each phase, and the heap each reopened keydir holds.
+
+```
+$ cabal run bitcask-workload -- 300000 100 4    # keys, value bytes, reader threads
+```
+
+Profiling builds go in their own build directory so they do not invalidate the
+normal one. For a time and allocation profile by cost centre, written to
+`bitcask-workload.prof`:
+
+```
+$ cabal run bitcask-workload --builddir=dist-prof --enable-profiling --profiling-detail=late -- 300000 +RTS -p -RTS
+```
+
+`late` cost centres are inserted after optimisation, so the profile describes the
+code that actually runs rather than a de-optimised copy of it.
+
+A heap profile by closure type needs no profiling build at all:
+
+```
+$ cabal run bitcask-workload -- 300000 +RTS -hT -i0.05 -RTS
+$ hp2ps -c bitcask-workload.hp
+```
+
+For GC statistics add `+RTS -s -RTS`, and for a timeline of threads and GC that
+can be opened in `ghc-events-analyze` or `eventlog2html`, `+RTS -l -RTS`.
+
+Two things worth knowing when reading the numbers. A `get` of a small value is
+one positional read, and the system call is almost all of its cost, so it tracks
+the OS more than this library. And the workload runs with `-N`: with many idle
+capabilities the parallel GC can cost more than it saves, which `+RTS -qg` or
+`-qn4` will show.
+
 ## Design
 
 [`DESIGN.md`](DESIGN.md) is the record of why the format, the error handling and

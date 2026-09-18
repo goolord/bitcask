@@ -21,14 +21,17 @@ module Database.Bitcask.Internal.Hint
   , decodeHintFile
   ) where
 
-import Data.Bits (shiftL, testBit, (.|.))
+import Data.Bits (testBit)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
-import Data.Word (Word16, Word32, Word64)
+import Data.Word (Word32, Word64)
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr (castPtr, plusPtr)
+import Foreign.Storable (pokeByteOff)
 
+import Database.Bitcask.Internal.Bytes
 import Database.Bitcask.Internal.CRC32 (crc32)
 import Database.Bitcask.Internal.Record (tombstoneFlag)
 import Database.Bitcask.Types (Offset, RecordError (..))
@@ -53,66 +56,68 @@ hintTrailerSize :: Int
 hintTrailerSize = 12
 
 encodeHintEntry :: HintEntry -> ByteString
-encodeHintEntry e =
-  BL.toStrict . BB.toLazyByteString $
-    BB.word64BE (hintTstamp e)
-      <> BB.word8 (if hintTombstone e then tombstoneFlag else 0)
-      <> BB.word16BE (fromIntegral (BS.length (hintKey e)) :: Word16)
-      <> BB.word32BE (hintValSize e)
-      <> BB.word64BE (hintPos e)
-      <> BB.byteString (hintKey e)
+encodeHintEntry e = BSI.unsafeCreate (hintEntrySize + klen) $ \p -> do
+  pokeBE64 p 0 (hintTstamp e)
+  pokeByteOff p 8 (if hintTombstone e then tombstoneFlag else 0)
+  pokeBE16 p 9 (fromIntegral klen)
+  pokeBE32 p 11 (hintValSize e)
+  pokeBE64 p 15 (hintPos e)
+  BSU.unsafeUseAsCString (hintKey e) $ \kp ->
+    copyBytes (p `plusPtr` hintEntrySize) (castPtr kp) klen
+  where
+    klen = BS.length (hintKey e)
 
 -- | The trailer, given the number of entries and the CRC accumulated over all
 -- the entry bytes that precede it.
 encodeHintTrailer :: Word64 -> Word32 -> ByteString
-encodeHintTrailer n c =
-  BL.toStrict . BB.toLazyByteString $ BB.word64BE n <> BB.word32BE c
+encodeHintTrailer n c = BSI.unsafeCreate hintTrailerSize $ \p -> do
+  pokeBE64 p 0 n
+  pokeBE32 p 8 c
 
--- | Decode a whole hint file, or refuse it. Refusing is always safe: the caller
--- falls back to scanning the data file.
+-- | Every entry of a hint file, in order, or a refusal. Refusing is always safe:
+-- the caller falls back to scanning the data file.
+--
+-- The whole file is checked — checksum, entry framing, entry count — before
+-- anything is returned, so a refused file never yields a partial result. The
+-- list itself is then produced lazily, so a consumer that streams it (the keydir
+-- rebuild does) never holds more than one entry at a time. Keys are slices of
+-- the input; copy them if they are to outlive it.
 decodeHintFile :: ByteString -> Either RecordError [HintEntry]
 decodeHintFile bs
   | BS.length bs < hintTrailerSize = Left BadHintTrailer
   | crc32 body /= storedCrc = Left BadHintTrailer
-  | otherwise = do
-      es <- go body
-      if fromIntegral (length es) == storedCount
-        then Right es
-        else Left BadHintTrailer
+  | not (framed 0 0) = Left BadHintTrailer
+  | otherwise = Right (entries 0)
   where
     (body, trailer) = BS.splitAt (BS.length bs - hintTrailerSize) bs
-    storedCount = be64 trailer 0
-    storedCrc = be32 trailer 8
+    storedCount = indexBE64 trailer 0
+    storedCrc = indexBE32 trailer 8
+    len = BS.length body
 
-    go :: ByteString -> Either RecordError [HintEntry]
-    go rest
-      | BS.null rest = Right []
-      | BS.length rest < hintEntrySize = Left BadHintTrailer
+    keySize off = fromIntegral (indexBE16 body (off + 9)) :: Int
+
+    -- Every entry lies wholly inside the body, and there are as many as the
+    -- trailer says.
+    framed :: Int -> Word64 -> Bool
+    framed !off !n
+      | off == len = n == storedCount
+      | len - off < hintEntrySize = False
       | otherwise =
-          let ksz = fromIntegral (be16 rest 9) :: Int
-              total = hintEntrySize + ksz
-           in if BS.length rest < total
-                then Left BadHintTrailer
-                else do
-                  let flags = BSU.unsafeIndex rest 8
-                      e =
-                        HintEntry
-                          { hintTstamp = be64 rest 0
-                          , hintTombstone = testBit flags 0
-                          , hintKey = BS.take ksz (BS.drop hintEntrySize rest)
-                          , hintValSize = be32 rest 11
-                          , hintPos = be64 rest 15
-                          , hintRecSize = fromIntegral (19 + ksz + fromIntegral (be32 rest 11))
-                          }
-                  (e :) <$> go (BS.drop total rest)
+          let total = hintEntrySize + keySize off
+           in len - off >= total && framed (off + total) (n + 1)
 
-be16 :: ByteString -> Int -> Word16
-be16 bs o =
-  (fromIntegral (BSU.unsafeIndex bs o) `shiftL` 8)
-    .|. fromIntegral (BSU.unsafeIndex bs (o + 1))
-
-be32 :: ByteString -> Int -> Word32
-be32 bs o = foldl (\acc i -> (acc `shiftL` 8) .|. fromIntegral (BSU.unsafeIndex bs (o + i))) 0 [0 .. 3]
-
-be64 :: ByteString -> Int -> Word64
-be64 bs o = foldl (\acc i -> (acc `shiftL` 8) .|. fromIntegral (BSU.unsafeIndex bs (o + i))) 0 [0 .. 7]
+    entries off
+      | off >= len = []
+      | otherwise =
+          let ksz = keySize off
+              vsz = indexBE32 body (off + 11)
+              e =
+                HintEntry
+                  { hintTstamp = indexBE64 body off
+                  , hintTombstone = testBit (BSU.unsafeIndex body (off + 8)) 0
+                  , hintKey = BSU.unsafeTake ksz (BSU.unsafeDrop (off + hintEntrySize) body)
+                  , hintValSize = vsz
+                  , hintPos = indexBE64 body (off + 15)
+                  , hintRecSize = fromIntegral (19 + ksz) + vsz
+                  }
+           in e : entries (off + hintEntrySize + ksz)

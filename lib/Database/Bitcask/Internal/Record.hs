@@ -36,16 +36,20 @@ module Database.Bitcask.Internal.Record
   , decodeRecord
   ) where
 
-import Control.Monad (unless, when)
-import Data.Bits (complement, shiftL, testBit, (.&.), (.|.))
+import Control.Monad (when)
+import Data.Bits (complement, testBit, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
-import Data.Word (Word16, Word32, Word64, Word8)
+import Data.Maybe (fromMaybe)
+import Data.Word (Word32, Word64, Word8)
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Ptr (castPtr, plusPtr)
+import Foreign.Storable (pokeByteOff)
 
-import Database.Bitcask.Internal.CRC32 (crc32)
+import Database.Bitcask.Internal.Bytes
+import Database.Bitcask.Internal.CRC32 (crc32, crc32Ptr)
 import Database.Bitcask.Types (RecordError (..))
 
 -- | Size of the fixed record header, in bytes.
@@ -79,21 +83,24 @@ recordSize h = headerSize + hdrKeySize h + hdrValSize h
 
 -- | Encode one record. Passing 'Nothing' for the value writes a tombstone.
 --
--- The body is materialised strictly because the CRC covers it; there is no way
--- to write the checksum first and stream the rest.
+-- One allocation of exactly the record's size: the fields are poked in, then the
+-- CRC is computed over the buffer in place and poked in front of them.
 encodeRecord :: Word64 -> ByteString -> Maybe ByteString -> ByteString
-encodeRecord ts k mv = BS.concat [beWord32 (crc32 body), body]
+encodeRecord ts k mv = BSI.unsafeCreate total $ \p -> do
+  pokeBE64 p 4 ts
+  pokeByteOff p 12 flags
+  pokeBE16 p 13 (fromIntegral klen)
+  pokeBE32 p 15 (fromIntegral vlen)
+  BSU.unsafeUseAsCString k $ \kp -> copyBytes (p `plusPtr` headerSize) (castPtr kp) klen
+  BSU.unsafeUseAsCString v $ \vp -> copyBytes (p `plusPtr` (headerSize + klen)) (castPtr vp) vlen
+  crc <- crc32Ptr 0 (p `plusPtr` 4) (total - 4)
+  pokeBE32 p 0 crc
   where
-    v = maybe BS.empty id mv
+    v = fromMaybe BS.empty mv
     flags = maybe tombstoneFlag (const 0) mv
-    body =
-      BL.toStrict . BB.toLazyByteString $
-        BB.word64BE ts
-          <> BB.word8 flags
-          <> BB.word16BE (fromIntegral (BS.length k) :: Word16)
-          <> BB.word32BE (fromIntegral (BS.length v) :: Word32)
-          <> BB.byteString k
-          <> BB.byteString v
+    klen = BS.length k
+    vlen = BS.length v
+    total = headerSize + klen + vlen
 
 -- | Decode a header from at least 'headerSize' bytes.
 decodeHeader :: ByteString -> Either RecordError Header
@@ -102,11 +109,11 @@ decodeHeader bs
   | otherwise =
       Right
         Header
-          { hdrCrc = be32 bs 0
-          , hdrTstamp = be64 bs 4
+          { hdrCrc = indexBE32 bs 0
+          , hdrTstamp = indexBE64 bs 4
           , hdrFlags = BSU.unsafeIndex bs 12
-          , hdrKeySize = fromIntegral (be16 bs 13)
-          , hdrValSize = fromIntegral (be32 bs 15)
+          , hdrKeySize = fromIntegral (indexBE16 bs 13)
+          , hdrValSize = fromIntegral (indexBE32 bs 15)
           }
 
 -- | Decode one record from a buffer whose first byte is the start of the record.
@@ -122,38 +129,14 @@ decodeRecord verify bs = do
   when (hdrFlags h .&. complement tombstoneFlag /= 0) $ Left (BadFlags (hdrFlags h))
   let isTomb = testBit (hdrFlags h) 0
   when (isTomb && hdrValSize h /= 0) $ Left MalformedTombstone
-  let body = BS.take (total - 4) (BS.drop 4 bs)
-      actual = crc32 body
-  unless (not verify || actual == hdrCrc h) $ Left (ChecksumMismatch (hdrCrc h) actual)
-  let k = BS.take (hdrKeySize h) (BS.drop headerSize bs)
-      v = BS.take (hdrValSize h) (BS.drop (headerSize + hdrKeySize h) bs)
+  when verify $ do
+    let actual = crc32 (BSU.unsafeTake (total - 4) (BSU.unsafeDrop 4 bs))
+    when (actual /= hdrCrc h) $ Left (ChecksumMismatch (hdrCrc h) actual)
+  let k = BSU.unsafeTake (hdrKeySize h) (BSU.unsafeDrop headerSize bs)
+      v = BSU.unsafeTake (hdrValSize h) (BSU.unsafeDrop (headerSize + hdrKeySize h) bs)
   pure
     Record
       { recTstamp = hdrTstamp h
       , recKey = k
       , recValue = if isTomb then Nothing else Just v
       }
-
-beWord32 :: Word32 -> ByteString
-beWord32 = BL.toStrict . BB.toLazyByteString . BB.word32BE
-
-be16 :: ByteString -> Int -> Word16
-be16 bs o =
-  (fromIntegral (BSU.unsafeIndex bs o) `shiftL` 8)
-    .|. fromIntegral (BSU.unsafeIndex bs (o + 1))
-
-be32 :: ByteString -> Int -> Word32
-be32 bs o = go 0 0
-  where
-    go :: Int -> Word32 -> Word32
-    go i acc
-      | i == 4 = acc
-      | otherwise = go (i + 1) ((acc `shiftL` 8) .|. fromIntegral (BSU.unsafeIndex bs (o + i)))
-
-be64 :: ByteString -> Int -> Word64
-be64 bs o = go 0 0
-  where
-    go :: Int -> Word64 -> Word64
-    go i acc
-      | i == 8 = acc
-      | otherwise = go (i + 1) ((acc `shiftL` 8) .|. fromIntegral (BSU.unsafeIndex bs (o + i)))

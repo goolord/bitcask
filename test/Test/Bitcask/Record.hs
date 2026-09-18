@@ -3,13 +3,13 @@ module Test.Bitcask.Record (tests) where
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Bits (xor)
-import Data.Word (Word64)
+import Data.Bits (complement, shiftR, xor, (.&.))
+import Data.Word (Word32, Word64)
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck
+import Test.Tasty.QuickCheck hiding ((.&.))
 
-import Database.Bitcask.Internal.CRC32 (crc32)
+import Database.Bitcask.Internal.CRC32 (crc32, crc32Update)
 import Database.Bitcask.Internal.Hint
 import Database.Bitcask.Internal.Record
 
@@ -25,6 +25,12 @@ tests =
         , testCase "check value" $ crc32 (BC.pack "123456789") @?= 0xCBF43926
         , testCase "the quick brown fox" $
             crc32 (BC.pack "The quick brown fox jumps over the lazy dog") @?= 0x414FA339
+        , testProperty "agrees with the bit-at-a-time definition" $
+            forAll longerBytes $ \bs -> crc32 bs === referenceCrc bs
+        , testProperty "crc32Update continues across a split" $
+            forAll longerBytes $ \bs -> forAll (choose (0, BS.length bs)) $ \i ->
+              let (a, b) = BS.splitAt i bs
+               in crc32Update (crc32 a) b === crc32 bs
         ]
     , testProperty "encode/decode roundtrip" $
         forAll smallBytes $ \k ->
@@ -102,3 +108,16 @@ hintEntry = do
       , hintPos = pos
       , hintRecSize = fromIntegral (headerSize + BS.length k) + vsz
       }
+
+-- | Byte strings long enough to exercise the eight-bytes-at-a-time loop and
+-- every length of tail after it.
+longerBytes :: Gen ByteString
+longerBytes = BS.pack <$> (choose (0, 200) >>= \n -> vectorOf n arbitrary)
+
+-- | CRC-32 straight from the definition, one bit at a time: slow, and too
+-- simple to get wrong, which is what makes it a reference.
+referenceCrc :: ByteString -> Word32
+referenceCrc = complement . BS.foldl' byte 0xFFFFFFFF
+  where
+    byte c b = iterate bit (c `xor` fromIntegral b) !! 8
+    bit c = if c .&. 1 /= 0 then (c `shiftR` 1) `xor` 0xEDB88320 else c `shiftR` 1

@@ -41,12 +41,14 @@ common rts-options
 
 library
     import:          extensions, ghc-options
+    ghc-options:     -O2
     hs-source-dirs:  lib
     exposed-modules:
         Database.Bitcask
         Database.Bitcask.Codec
         Database.Bitcask.Raw
         Database.Bitcask.Types
+        Database.Bitcask.Internal.Bytes
         Database.Bitcask.Internal.CRC32
         Database.Bitcask.Internal.File
         Database.Bitcask.Internal.Hint
@@ -108,3 +110,40 @@ test-suite bitcask-test
         tasty-quickcheck  >=0.10 && <0.12,
         temporary         >=1.3  && <1.4,
         text
+
+-- Micro and store benchmarks. See the header of bench/Main.hs.
+benchmark bitcask-bench
+    import:          extensions, ghc-options
+    type:            exitcode-stdio-1.0
+    hs-source-dirs:  bench
+    main-is:         Main.hs
+    -- One capability: the per-operation numbers are for a single thread, and
+    -- idle capabilities only add GC synchronisation noise.
+    ghc-options:     -O2 -rtsopts "-with-rtsopts=-A32m"
+    build-depends:
+        base,
+        bitcask,
+        bytestring,
+        directory,
+        filepath,
+        tasty,
+        tasty-bench       >=0.3  && <0.5,
+        temporary         >=1.3  && <1.4,
+        text
+
+-- An end-to-end workload to profile against; see "Profiling" in README.md.
+-- A benchmark rather than an executable so that installing the library does not
+-- install it.
+benchmark bitcask-workload
+    import:          extensions, ghc-options, rts-options
+    type:            exitcode-stdio-1.0
+    hs-source-dirs:  bench
+    main-is:         Workload.hs
+    ghc-options:     -O2 "-with-rtsopts=-N -T"
+    build-depends:
+        base,
+        bitcask,
+        bytestring,
+        directory,
+        filepath,
+        temporary         >=1.3  && <1.4

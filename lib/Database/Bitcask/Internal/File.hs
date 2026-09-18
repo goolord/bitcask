@@ -12,7 +12,7 @@ module Database.Bitcask.Internal.File
 
     -- * Scanning
   , foldDataFile
-  , refsFromHint
+  , refFromHint
   , readHintRefs
 
     -- * The meta file
@@ -161,17 +161,20 @@ foldDataFile verify path fid rh size step = go 0 BS.empty
     headerBytes :: Word64
     headerBytes = 19
 
--- | Turn hint entries into keydir refs.
-refsFromHint :: FileId -> [HintEntry] -> [Ref]
-refsFromHint fid = map $ \e ->
+-- | Turn a hint entry into a keydir ref.
+refFromHint :: FileId -> HintEntry -> Ref
+refFromHint fid e =
   Ref
     { refKey = hintKey e
     , refLoc = Loc fid (hintPos e) (hintRecSize e) (hintTstamp e)
     , refTombstone = hintTombstone e
     }
 
--- | Read a hint file if there is a complete one. 'Nothing' means \"scan the data
--- file instead\", which is always a safe answer.
+-- | The refs of a hint file, in write order, if there is a complete hint file.
+-- 'Nothing' means \"scan the data file instead\", which is always a safe answer.
+--
+-- The file is fully validated before this returns; the list is then produced
+-- lazily as it is consumed.
 readHintRefs :: FilePath -> FileId -> IO (Maybe [Ref])
 readHintRefs dir fid = do
   let p = hintPath dir fid
@@ -180,11 +183,11 @@ readHintRefs dir fid = do
     then pure Nothing
     else do
       r <- try (BS.readFile p)
-      pure $ case r of
+      pure $! case r of
         Left (_ :: IOException) -> Nothing
         Right bs -> case decodeHintFile bs of
           Left _ -> Nothing
-          Right es -> Just (refsFromHint fid es)
+          Right es -> Just (map (refFromHint fid) es)
 
 -- | Bumped whenever the on-disk format changes incompatibly.
 formatVersion :: Word32

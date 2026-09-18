@@ -34,11 +34,12 @@ import Control.Monad (foldM, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
+import qualified Data.List as L
+import Data.Word (Word64)
 import qualified Data.Map.Strict as M
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 
-import Database.Bitcask.Internal.CRC32 (crc32Update)
 import Database.Bitcask.Internal.File (dataPath, hintPath, listDataFiles, readPending, writePending)
 import Database.Bitcask.Internal.Hint (HintEntry (..), encodeHintEntry)
 import qualified Database.Bitcask.Internal.Keydir as KD
@@ -89,13 +90,18 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
       -- Every live record that still lives in an input file. Reading the keydir
       -- rather than scanning the inputs means dead records and tombstones are
       -- never even looked at.
+      --
+      -- They are read with 'sweepRecords', which visits them roughly in file
+      -- and offset order a window at a time. The keydir is a hash table, so its
+      -- own order is random, and reading the inputs in it would turn a sequential
+      -- pass over each file into a random read per record.
       kd <- readIORef (stKeydir st)
       let todo = [(k, l) | (k, l) <- KD.toList kd, locFileId l `Set.member` inputSet]
 
       out0 <- openActive (stDir st) (mkFileId outBase firstSub)
       bumpTotal st (acFileId out0) 0
-      (out, copied) <- foldM (copyOne st) (out0, 0 :: Int) todo
-      closeActive st out
+      out <- sweepRecords st (copyOne st) (Out out0 [] [] 0 0) todo >>= flushOut st
+      closeActive st (outActive out)
 
       -- Nothing in the keydir can reference an input any more: new writes only
       -- ever land in the active file, so every reference either moved above or
@@ -105,26 +111,57 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
       pure
         MergeStats
           { mergedFiles = length inputs
-          , mergedRecords = copied
+          , mergedRecords = outCopied out
           , reclaimedBytes = reclaimable
           }
 
--- | Copy one live record into the merge output, then claim it in the keydir.
-copyOne :: Store -> (Active, Int) -> (ByteString, Loc) -> IO (Active, Int)
-copyOne st (out0, n) (k, loc) = do
-  bytes <- withReader st (locFileId loc) $ \rh ->
-    preadAt rh (locPos loc) (fromIntegral (locSize loc))
+-- | The merge output, and the copies written to it that are not yet visible.
+--
+-- Copied records are written in blocks rather than one at a time, for the same
+-- reason reads are swept: the system call per record, not the copying, is what a
+-- record-at-a-time merge spends its time on. A copy must be on disk before the
+-- keydir is pointed at it, so the keydir claims for a block are made when the
+-- block is written, all in one update.
+data Out = Out
+  { outActive :: !Active
+  -- ^ its offset already counts the pending bytes
+  , outPending :: ![Claim]
+  -- ^ newest first
+  , outPendingBytes :: ![ByteString]
+  -- ^ newest first
+  , outPendingLen :: !Int
+  , outCopied :: !Int
+  }
+
+-- | Move a key from one location to another, if it is still at the first.
+data Claim = Claim !ByteString !Loc !Loc
+
+-- | Copy one live record into the merge output.
+copyOne :: Store -> Out -> ByteString -> Loc -> Maybe ByteString -> IO Out
+copyOne st out0 k loc swept = do
+  -- A sweep read that failed or came up short gets one careful retry on its
+  -- own; that one is allowed to throw.
+  bytes <- case swept of
+    Just b -> pure b
+    Nothing -> withReader st (locFileId loc) $ \rh ->
+      preadAt rh (locPos loc) (fromIntegral (locSize loc))
   if BS.length bytes < fromIntegral (locSize loc)
-    then pure (out0, n) -- the entry went stale under us; the newer write wins
+    then pure out0 -- the entry went stale under us; the newer write wins
     else case decodeRecord (verifyChecksums (stOpts st)) bytes of
       Left err -> throwIO (CorruptRecord (dataPath (stDir st) (locFileId loc)) (locPos loc) err)
       Right r
-        | recKey r /= k || isNothing (recValue r) -> pure (out0, n)
+        | recKey r /= k || isNothing (recValue r) -> pure out0
         | otherwise -> do
-            out <- if needsRoll out0 (BS.length bytes) then rollMergeOutput st out0 else pure out0
-            let off = acOffset out
-            appendBytes (acData out) bytes
-            let hintBytes =
+            out <-
+              if needsRoll (outActive out0) (BS.length bytes)
+                then do
+                  o <- flushOut st out0
+                  a <- rollMergeOutput st (outActive o)
+                  pure o {outActive = a}
+                else pure out0
+            let ac = outActive out
+                off = acOffset ac
+                hintBytes =
                   encodeHintEntry
                     HintEntry
                       { hintTstamp = recTstamp r
@@ -134,26 +171,44 @@ copyOne st (out0, n) (k, loc) = do
                       , hintPos = off
                       , hintRecSize = locSize loc
                       }
-            appendBytes (acHint out) hintBytes
-            let newLoc = Loc (acFileId out) off (locSize loc) (recTstamp r)
-            -- Compare-on-location: install the new place only if nobody moved
-            -- the key while we were copying it.
-            claimed <- atomicModifyIORef' (stKeydir st) $ \m -> case KD.lookup k m of
-              Just cur | cur == loc -> (KD.insert k newLoc m, True)
-              _ -> (m, False)
-            bumpTotal st (acFileId out) (fromIntegral (BS.length bytes))
-            when (not claimed) $ bumpDead st (acFileId out) (fromIntegral (BS.length bytes))
-            pure
-              ( out
-                  { acOffset = off + fromIntegral (BS.length bytes)
-                  , acHintCrc = crc32Update (acHintCrc out) hintBytes
-                  , acHintCount = acHintCount out + 1
-                  }
-              , n + 1
-              )
+                newLoc = Loc (acFileId ac) off (locSize loc) (recTstamp r)
+            ac' <- appendHint ac {acOffset = off + fromIntegral (BS.length bytes)} hintBytes
+            let out' =
+                  out
+                    { outActive = ac'
+                    , outPending = Claim k loc newLoc : outPending out
+                    , outPendingBytes = bytes : outPendingBytes out
+                    , outPendingLen = outPendingLen out + BS.length bytes
+                    , outCopied = outCopied out + 1
+                    }
+            if outPendingLen out' >= mergeBlockSize then flushOut st out' else pure out'
   where
-    needsRoll out len =
-      acOffset out > 0 && acOffset out + fromIntegral len > maxFileSize (stOpts st)
+    needsRoll ac len =
+      acOffset ac > 0 && acOffset ac + fromIntegral len > maxFileSize (stOpts st)
+
+-- | Write the pending copies, then point the keydir at them.
+flushOut :: Store -> Out -> IO Out
+flushOut st out
+  | null (outPending out) = pure out
+  | otherwise = do
+      let ac = outActive out
+          fid = acFileId ac
+      appendBytes (acData ac) (BS.concat (reverse (outPendingBytes out)))
+      -- Compare-on-location: install each new place only if nobody moved the key
+      -- while we were copying it. A put that got there first wins, and the copy
+      -- is dead on arrival.
+      lost <- atomicModifyIORef' (stKeydir st) $ \kd0 ->
+        let claim (kd, dead) (Claim k old new) = case KD.replaceIf k old new kd of
+              (kd', True) -> (kd', dead)
+              (_, False) -> (kd, dead + fromIntegral (locSize new))
+         in L.foldl' claim (kd0, 0 :: Word64) (reverse (outPending out))
+      bumpTotal st fid (fromIntegral (outPendingLen out))
+      when (lost > 0) $ bumpDead st fid lost
+      pure out {outPending = [], outPendingBytes = [], outPendingLen = 0}
+
+-- | How much copied data merge collects before writing it out.
+mergeBlockSize :: Int
+mergeBlockSize = 256 * 1024
 
 -- | Roll the merge output to the next sub-sequence id at the same base, which
 -- keeps it sorting before the active file.

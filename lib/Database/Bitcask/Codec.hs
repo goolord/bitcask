@@ -18,6 +18,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Builder.Extra as BBE
 import qualified Data.ByteString.Lazy as BL
 import Data.Bits (Bits, shiftL)
 import Data.Int (Int32, Int64)
@@ -54,8 +55,19 @@ class Codec a where
   fromBytes :: ByteString -> Either String a
 
 -- | Run 'toBytes' and get the strict bytes that would be written.
+--
+-- Every 'Database.Bitcask.put' runs this twice, so the allocation strategy is
+-- tuned for what keys and values usually are: small. The default strategy starts
+-- with a four-kilobyte buffer and then copies the result out of it if it came
+-- out much smaller, which for a 16-byte key is two allocations and a copy to
+-- produce 16 bytes. This starts with a buffer just big enough for a typical
+-- small key or value, and does not trim: when the whole encoding fits the
+-- first buffer, the result is a slice of it and there is no copy at all.
 encodeStrict :: (Codec a) => a -> ByteString
-encodeStrict = BL.toStrict . BB.toLazyByteString . toBytes
+encodeStrict =
+  BL.toStrict
+    . BBE.toLazyByteStringWith (BBE.untrimmedStrategy 128 BBE.smallChunkSize) BL.empty
+    . toBytes
 {-# INLINE encodeStrict #-}
 
 -- $deriving

@@ -6,6 +6,7 @@
 module Database.Bitcask.Internal.Store
   ( Store (..)
   , Active (..)
+  , Readers
 
     -- * Lifecycle
   , openStore
@@ -27,9 +28,11 @@ module Database.Bitcask.Internal.Store
   , retireReader
   , bumpDead
   , fetchAt
+  , sweepRecords
   , rollActive
   , openActive
   , closeActive
+  , appendHint
   , bumpTotal
   , setDead
   , assertOpen
@@ -41,13 +44,14 @@ import Control.Exception (IOException, bracketOnError, throwIO, try)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BSU
 import Data.IORef
-import Data.List (foldl')
+import qualified Data.List as L
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isNothing)
 import qualified Data.Text as T
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock.System (SystemTime (..), getSystemTime)
 import Data.Word (Word32, Word64)
 import System.Directory (createDirectoryIfMissing, getFileSize, removeFile)
 
@@ -69,6 +73,20 @@ data Active = Active
   , acOffset :: !Word64
   , acHintCrc :: !Word32
   , acHintCount :: !Word64
+  , acHintBuf :: ![ByteString]
+  -- ^ hint entries not yet written, newest first; see 'appendHint'
+  , acHintBufLen :: !Int
+  }
+
+-- | Read handles for the data files, by id.
+--
+-- The map is read without a lock, because every 'Database.Bitcask.get' needs a
+-- handle and taking a lock there would serialise all readers on it. The lock is
+-- only for changing the map, so that two threads that miss at once do not both
+-- open the file.
+data Readers = Readers
+  { rdMap :: !(IORef (Map FileId ReadHandle))
+  , rdLock :: !(MVar ())
   }
 
 data Store = Store
@@ -78,7 +96,7 @@ data Store = Store
   -- ^ read without a lock; updated with 'atomicModifyIORef''
   , stActive :: !(MVar (Maybe Active))
   -- ^ 'Nothing' for a read-only store; taking it serialises writes
-  , stReaders :: !(MVar (Map FileId ReadHandle))
+  , stReaders :: !Readers
   , stLock :: !StoreLock
   , stClosed :: !(IORef Bool)
   , stTotal :: !(IORef (Map FileId Word64))
@@ -95,7 +113,9 @@ data Store = Store
   }
 
 nowNanos :: IO Word64
-nowNanos = round . (* 1e9) <$> getPOSIXTime
+nowNanos = do
+  MkSystemTime s ns <- getSystemTime
+  pure (fromIntegral s * 1000000000 + fromIntegral ns)
 
 assertOpen :: Store -> IO ()
 assertOpen st = do
@@ -121,7 +141,7 @@ openStore dir opts = do
     Right l -> pure l
   bracketOnError (pure lock) releaseLock $ \_ -> do
     unless (readOnly opts) (sweepPending dir)
-    readers <- newMVar M.empty
+    readers <- Readers <$> newIORef M.empty <*> newMVar ()
     fids <- listDataFiles dir
     sizes <- mapM (\f -> (,) f . fromIntegral <$> getFileSize (dataPath dir f)) fids
     let totals = M.fromList sizes
@@ -163,8 +183,8 @@ openStore dir opts = do
 deadFrom :: Map FileId Word64 -> Keydir -> Map FileId Word64
 deadFrom totals kd = M.unionWith sub totals live
   where
-    live = foldl' add M.empty (KD.toList kd)
-    add m (_, l) = M.insertWith (+) (locFileId l) (fromIntegral (locSize l)) m
+    live = KD.foldlLocs' add M.empty kd
+    add m l = M.insertWith (+) (locFileId l) (fromIntegral (locSize l)) m
     sub total alive = if total > alive then total - alive else 0
 
 checkMeta :: FilePath -> OpenOptions -> IO ()
@@ -184,14 +204,14 @@ checkMeta dir opts = do
 --
 -- Files are visited in ascending id order, which is write order, so the last ref
 -- for a key simply wins. See "Database.Bitcask.Internal.Keydir".
-rebuild :: FilePath -> OpenOptions -> MVar (Map FileId ReadHandle) -> [FileId] -> IO Keydir
+rebuild :: FilePath -> OpenOptions -> Readers -> [FileId] -> IO Keydir
 rebuild dir opts readers fids = foldM one KD.empty (zip fids (repeat ()))
   where
     lastFid = if null fids then Nothing else Just (maximum fids)
     one kd (fid, ()) = do
       mhint <- readHintRefs dir fid
       case mhint of
-        Just refs -> pure (foldl' (flip KD.applyRef) kd refs)
+        Just refs -> pure $! L.foldl' (flip KD.applyRef) kd refs
         Nothing -> do
           rh <- cachedReader dir readers fid
           size <- fromIntegral <$> getFileSize (dataPath dir fid)
@@ -212,19 +232,32 @@ rebuild dir opts readers fids = foldM one KD.empty (zip fids (repeat ()))
                 closeReaderFor readers fid
                 truncateAt (dataPath dir fid) at
               else pure ()
-          pure kd'
+          pure $! kd'
 
-cachedReader :: FilePath -> MVar (Map FileId ReadHandle) -> FileId -> IO ReadHandle
-cachedReader dir readers fid = modifyMVar readers $ \m -> case M.lookup fid m of
-  Just rh -> pure (m, rh)
-  Nothing -> do
-    rh <- openRead (dataPath dir fid)
-    pure (M.insert fid rh m, rh)
+-- | The read handle for a file, opening it on first use. Lock-free when the
+-- handle is already open, which is every time but the first.
+cachedReader :: FilePath -> Readers -> FileId -> IO ReadHandle
+cachedReader dir rd fid = do
+  m <- readIORef (rdMap rd)
+  case M.lookup fid m of
+    Just rh -> pure rh
+    Nothing -> withMVar (rdLock rd) $ \() -> do
+      -- Someone may have opened it while we waited for the lock.
+      m' <- readIORef (rdMap rd)
+      case M.lookup fid m' of
+        Just rh -> pure rh
+        Nothing -> do
+          rh <- openRead (dataPath dir fid)
+          atomicModifyIORef' (rdMap rd) (\m'' -> (M.insert fid rh m'', ()))
+          pure rh
 
-closeReaderFor :: MVar (Map FileId ReadHandle) -> FileId -> IO ()
-closeReaderFor readers fid = modifyMVar_ readers $ \m -> do
-  forM_ (M.lookup fid m) closeRead
-  pure (M.delete fid m)
+-- | Forget a file's read handle, handing it back if there was one.
+dropReader :: Readers -> FileId -> IO (Maybe ReadHandle)
+dropReader rd fid = withMVar (rdLock rd) $ \() ->
+  atomicModifyIORef' (rdMap rd) (\m -> (M.delete fid m, M.lookup fid m))
+
+closeReaderFor :: Readers -> FileId -> IO ()
+closeReaderFor rd fid = dropReader rd fid >>= mapM_ closeRead
 
 -- | Delete files a previous merge could not remove because a reader still held
 -- them open. Only Windows ever leaves these behind.
@@ -252,12 +285,45 @@ openActive dir fid = do
       , acOffset = off
       , acHintCrc = 0
       , acHintCount = 0
+      , acHintBuf = []
+      , acHintBufLen = 0
       }
+
+-- | Add an entry to the active file's hint file.
+--
+-- Hint entries are buffered and written in blocks, which saves the write path one
+-- system call per record — roughly half of what a 'Database.Bitcask.put' costs.
+-- Unlike the data file, nothing reads a hint file until the file is finished and
+-- its trailer written, so there is nobody to see the difference; and a crash
+-- that loses the buffer loses nothing, because a hint file without its trailer is
+-- ignored in favour of scanning the data file.
+appendHint :: Active -> ByteString -> IO Active
+appendHint ac bytes = do
+  let ac' =
+        ac
+          { acHintCrc = crc32Update (acHintCrc ac) bytes
+          , acHintCount = acHintCount ac + 1
+          , acHintBuf = bytes : acHintBuf ac
+          , acHintBufLen = acHintBufLen ac + BS.length bytes
+          }
+  if acHintBufLen ac' >= hintBufferSize then flushHint ac' else pure ac'
+
+-- | Write out buffered hint entries.
+flushHint :: Active -> IO Active
+flushHint ac
+  | null (acHintBuf ac) = pure ac
+  | otherwise = do
+      appendBytes (acHint ac) (BS.concat (reverse (acHintBuf ac)))
+      pure ac {acHintBuf = [], acHintBufLen = 0}
+
+hintBufferSize :: Int
+hintBufferSize = 64 * 1024
 
 -- | Finish the active file: cap its hint file with the trailer that makes it
 -- usable, sync the data, and close both.
 closeActive :: Store -> Active -> IO ()
-closeActive st ac = do
+closeActive st ac0 = do
+  ac <- flushHint ac0
   appendBytes (acHint ac) (encodeHintTrailer (acHintCount ac) (acHintCrc ac))
   syncFile (acHint ac)
   syncFile (acData ac)
@@ -286,9 +352,9 @@ withReader st fid act = act =<< cachedReader (stDir st) (stReaders st) fid
 -- the read fails, at worst the descriptor has already been recycled. The handle
 -- is parked instead and closed when the store closes.
 retireReader :: Store -> FileId -> IO ()
-retireReader st fid = modifyMVar_ (stReaders st) $ \m -> do
-  forM_ (M.lookup fid m) $ \rh -> atomicModifyIORef' (stRetired st) (\rs -> (rh : rs, ()))
-  pure (M.delete fid m)
+retireReader st fid = do
+  old <- dropReader (stReaders st) fid
+  forM_ old $ \rh -> atomicModifyIORef' (stRetired st) (\rs -> (rh : rs, ()))
 
 -- ---------------------------------------------------------------------------
 -- Reads
@@ -353,11 +419,67 @@ foldRaw :: Store -> (a -> ByteString -> ByteString -> IO a) -> a -> IO a
 foldRaw st f z = do
   assertOpen st
   kd <- readIORef (stKeydir st)
-  foldM step z (KD.toList kd)
+  sweepRecords st step z (KD.toList kd)
   where
-    step acc (k, loc) = do
-      mv <- fetchAt st k loc 0
+    step acc k loc mbytes = do
+      mv <- case decodeRecord (verifyChecksums (stOpts st)) <$> mbytes of
+        Just (Right r)
+          | recKey r == k, Just v <- recValue r ->
+              -- A copy, so that a caller holding on to values does not hold on
+              -- to the whole read window each one was sliced from.
+              pure (Just (BS.copy v))
+        -- Anything unexpected goes the slow way, which knows how to retry
+        -- around a concurrent merge and how to report real corruption.
+        _ -> fetchAt st k loc 0
       maybe (pure acc) (f acc k) mv
+
+-- | Visit the records at a set of locations, reading each file in large
+-- windows instead of making one positional read per record.
+--
+-- A positional read costs a system call whatever its size, and for the ~100-byte
+-- records Bitcask is built for the call is nearly all of the cost. So the
+-- locations are bucketed by file and by which 'sweepWindow'-sized stretch of the
+-- file they start in, each bucket is fetched with a single read spanning its
+-- records, and the records are sliced out of that. Buckets are visited in file
+-- and offset order, so each file is read front to back; within a bucket the
+-- order is unspecified. Bucketing rather than sorting matters: sorting every
+-- live key by location cost more than all the reads it saved.
+--
+-- The callback gets exactly the record's bytes, or 'Nothing' if the read failed
+-- or came up short; it decides what to do about that, typically by falling back
+-- to the careful per-record path.
+sweepRecords
+  :: Store
+  -> (a -> ByteString -> Loc -> Maybe ByteString -> IO a)
+  -> a
+  -> [(ByteString, Loc)]
+  -> IO a
+sweepRecords st f z items = foldM bucket z (M.toAscList buckets)
+  where
+    buckets =
+      M.fromListWith
+        (++)
+        [((locFileId l, locPos l `quot` sweepWindow), [x]) | x@(_, l) <- items]
+
+    bucket acc ((fid, _), batch) = do
+      let start = minimum [locPos l | (_, l) <- batch]
+          end = maximum [locPos l + fromIntegral (locSize l) | (_, l) <- batch]
+      r <- try (withReader st fid $ \rh -> preadAt rh start (fromIntegral (end - start)))
+      case r of
+        Left (_ :: IOException) -> foldM (\a (k, l) -> f a k l Nothing) acc batch
+        Right buf -> foldM (\a (k, l) -> f a k l (slice buf start l)) acc batch
+
+    slice buf start l
+      | o + n <= BS.length buf = Just (BSU.unsafeTake n (BSU.unsafeDrop o buf))
+      | otherwise = Nothing
+      where
+        o = fromIntegral (locPos l - start)
+        n = fromIntegral (locSize l)
+
+-- | How much of a file one sweep read covers: records are bucketed by which
+-- stretch of this size they start in.
+sweepWindow :: Word64
+sweepWindow = 1024 * 1024
 
 -- | Fold over keys and locations without reading, or decoding, any values.
 foldRefsRaw :: Store -> (a -> ByteString -> Loc -> IO a) -> a -> IO a
@@ -401,23 +523,17 @@ appendRecord st k mv = do
                 , hintPos = off
                 , hintRecSize = fromIntegral n
                 }
-      appendBytes (acHint ac) hintBytes
+      -- Before the keydir update: a hint flush that throws must leave the put
+      -- invisible, as a failed put should be.
+      ac' <- appendHint ac {acOffset = off + fromIntegral n} hintBytes
       let loc = Loc (acFileId ac) off (fromIntegral n) ts
-      old <- atomicModifyIORef' (stKeydir st) $ \kd ->
-        ( if isNothing mv then KD.delete k kd else KD.insert k loc kd
-        , KD.lookup k kd
-        )
+      old <- atomicModifyIORef' (stKeydir st) $
+        KD.replace k (if isNothing mv then Nothing else Just loc)
       forM_ old $ \o -> bumpDead st (locFileId o) (fromIntegral (locSize o))
       -- A tombstone is never reachable from the keydir, so it is dead the
       -- instant it is written.
       when (isNothing mv) $ bumpDead st (acFileId ac) (fromIntegral n)
       bumpTotal st (acFileId ac) (fromIntegral n)
-      let ac' =
-            ac
-              { acOffset = off + fromIntegral n
-              , acHintCrc = crc32Update (acHintCrc ac) hintBytes
-              , acHintCount = acHintCount ac + 1
-              }
       maybeSync st ac'
       pure (Just ac')
   where
@@ -450,9 +566,10 @@ syncStore st = do
   assertOpen st
   withMVar (stActive st) $ \case
     Nothing -> pure ()
-    Just ac -> do
-      syncFile (acData ac)
-      syncFile (acHint ac)
+    -- Only the data file. The hint file is not worth an fsync of its own: until
+    -- its trailer is written at close it is ignored on open anyway, and
+    -- 'closeActive' syncs it then.
+    Just ac -> syncFile (acData ac)
 
 statsStore :: Store -> IO Stats
 statsStore st = do
@@ -475,7 +592,9 @@ closeStore st = do
     modifyMVar_ (stActive st) $ \case
       Nothing -> pure Nothing
       Just ac -> closeActive st ac >> pure Nothing
-    modifyMVar_ (stReaders st) $ \m -> mapM_ closeRead (M.elems m) >> pure M.empty
+    let rd = stReaders st
+    withMVar (rdLock rd) $ \() ->
+      atomicModifyIORef' (rdMap rd) (\m -> (M.empty, m)) >>= mapM_ closeRead . M.elems
     readIORef (stRetired st) >>= mapM_ closeRead
     writeIORef (stRetired st) []
     releaseLock (stLock st)
