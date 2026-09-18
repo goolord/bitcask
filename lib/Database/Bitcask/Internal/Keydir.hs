@@ -1,16 +1,12 @@
--- | The in-memory index, and the pure state machine that rebuilds it.
+-- | The in-memory index, and the pure fold that rebuilds it.
 --
--- Recovery is the part of a log-structured store that is hardest to get right
--- and scariest to get wrong, so it lives here as a pure fold: the IO layer turns
--- files into a stream of @('ByteString', 'Loc', isTombstone)@ and 'replay'
--- builds the keydir. No filesystem, no platform layer, and therefore trivially
--- property-testable.
+-- Recovery is a pure fold so it can be property-tested without touching the
+-- filesystem. The IO layer turns files into @('ByteString', 'Loc',
+-- isTombstone)@ refs and 'replay' builds the keydir.
 --
--- The one invariant callers must honour: refs are applied in ascending
--- @('FileId', offset)@ order, which is the order writes actually happened. Given
--- that, the newest ref for a key always wins by simply overwriting the older,
--- and no timestamp comparison is needed — which is the point, because a
--- timestamp comparison would make recovery depend on the system clock.
+-- Refs must be applied in @('FileId', offset)@ order, which is write order.
+-- Then the newest ref for a key just overwrites the older ones, with no
+-- timestamp comparison, so recovery doesn't depend on the clock.
 module Database.Bitcask.Internal.Keydir
   ( Keydir
   , Ref (..)
@@ -43,21 +39,16 @@ import Data.Word (Word64)
 
 import Database.Bitcask.Types (Loc (..))
 
--- | Encoded key bytes to the location of that key's live record.
+-- | Encoded key to the location of its live record.
 --
--- Keys are held as 'ShortByteString', copied in on insert, rather than as the
--- 'ByteString' they arrive in. A 'ByteString' key is very often a slice of
--- something much bigger — a one-megabyte scan buffer on open, a whole hint file,
--- a caller's own buffer — and the keydir would keep the whole of that alive for
--- as long as the key is live: opening a store by scanning its data files used to
--- keep every data file in memory. A 'ShortByteString' is exactly its own bytes
--- and is not pinned, so the GC can move and compact it. It costs about 16 bytes
--- a key more than a 'ByteString' slice would, not counting whatever that slice
--- would have kept alive.
+-- Keys are copied into 'ShortByteString's on insert. The incoming 'ByteString'
+-- is often a slice of something much bigger (a scan buffer, a hint file, the
+-- caller's buffer) and would keep all of it alive. Scanning on open used to
+-- keep every data file in memory this way. 'ShortByteString' is unpinned and
+-- costs about 16 bytes more per key than a slice.
 newtype Keydir = Keydir (HashMap ShortByteString Loc)
 
--- | One record's worth of index information, as recovered from a data file or a
--- hint file.
+-- | Index info for one record, from a data file or hint file.
 data Ref = Ref
   { refKey :: !ByteString
   , refLoc :: !Loc
@@ -68,8 +59,7 @@ data Ref = Ref
 empty :: Keydir
 empty = Keydir HM.empty
 
--- | Fold one ref into the keydir. A tombstone removes the key; anything else
--- replaces it.
+-- | Apply one ref. Tombstones delete, anything else replaces.
 applyRef :: Ref -> Keydir -> Keydir
 applyRef r kd
   | refTombstone r = delete (refKey r) kd
@@ -92,15 +82,15 @@ delete k (Keydir m) = Keydir (HM.delete (SBS.toShort k) m)
 insert :: ByteString -> Loc -> Keydir -> Keydir
 insert k l (Keydir m) = Keydir (HM.insert (SBS.toShort k) l m)
 
--- | Insert or delete, and hand back what the key used to map to, in a single
--- traversal. This is the write path's one keydir update.
+-- | Insert or delete and return the old location, in one traversal. Used by
+-- the write path.
 replace :: ByteString -> Maybe Loc -> Keydir -> (Keydir, Maybe Loc)
 replace k new (Keydir m) =
   let (old, m') = HM.alterF (\o -> (o, new)) (SBS.toShort k) m
    in (Keydir m', old)
 
--- | Set a key's location, but only if it is currently @expected@. Returns
--- whether it was. This is merge's compare-on-location claim.
+-- | Set a key's location only if it's currently @expected@. Returns whether it
+-- was. Used by merge.
 replaceIf :: ByteString -> Loc -> Loc -> Keydir -> (Keydir, Bool)
 replaceIf k expected new (Keydir m) =
   case HM.alterF claim (SBS.toShort k) m of
@@ -120,7 +110,7 @@ toList (Keydir m) = [(SBS.fromShort k, l) | (k, l) <- HM.toList m]
 foldlWithKey' :: (a -> ByteString -> Loc -> a) -> a -> Keydir -> a
 foldlWithKey' f z (Keydir m) = HM.foldlWithKey' (\a k l -> f a (SBS.fromShort k) l) z m
 
--- | Strict left fold over every location, without materialising any key.
+-- | Strict left fold over every location, without building any keys.
 foldlLocs' :: (a -> Loc -> a) -> a -> Keydir -> a
 foldlLocs' f z (Keydir m) = HM.foldl' f z m
 

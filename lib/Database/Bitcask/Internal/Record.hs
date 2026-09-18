@@ -1,5 +1,4 @@
--- | The on-disk record codec. Pure, total, and the single source of truth for
--- the file format.
+-- | The on-disk record format.
 --
 -- > offset  size  field
 -- >      0     4  crc     CRC-32 over bytes 4..end
@@ -12,12 +11,10 @@
 --
 -- All integers are big-endian.
 --
--- Two deliberate divergences from the paper. Tombstones get a flag bit rather
--- than the paper's \"special tombstone value\", which keeps the value space total
--- — you can store the empty string, and there is no magic byte string that is
--- secretly unstorable. And the sizes are fixed-width rather than varints, which
--- caps keys at 64 KiB and values at 4 GiB but makes the header a constant 19
--- bytes, so a reader can pull a header without parsing anything first.
+-- Differences from the paper: tombstones are a flag bit instead of a special
+-- value, so any byte string (including empty) can be stored. Sizes are
+-- fixed-width, not varints. That caps keys at 64 KiB and values at 4 GiB, but
+-- the header is always 19 bytes.
 module Database.Bitcask.Internal.Record
   ( -- * Layout
     headerSize
@@ -83,8 +80,8 @@ recordSize h = headerSize + hdrKeySize h + hdrValSize h
 
 -- | Encode one record. Passing 'Nothing' for the value writes a tombstone.
 --
--- One allocation of exactly the record's size: the fields are poked in, then the
--- CRC is computed over the buffer in place and poked in front of them.
+-- Allocates once at the exact size, pokes the fields, then computes the CRC
+-- in place.
 encodeRecord :: Word64 -> ByteString -> Maybe ByteString -> ByteString
 encodeRecord ts k mv = BSI.unsafeCreate total $ \p -> do
   pokeBE64 p 4 ts
@@ -116,9 +113,8 @@ decodeHeader bs
           , hdrValSize = fromIntegral (indexBE32 bs 15)
           }
 
--- | Decode one record from a buffer whose first byte is the start of the record.
--- Trailing bytes beyond the record are ignored, so this can be pointed straight
--- at a scan buffer.
+-- | Decode one record from the start of a buffer. Trailing bytes are ignored,
+-- so this works on a scan buffer.
 --
 -- Pass 'False' to skip checksum verification.
 decodeRecord :: Bool -> ByteString -> Either RecordError Record

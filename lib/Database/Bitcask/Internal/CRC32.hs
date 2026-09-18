@@ -1,16 +1,10 @@
--- | CRC-32 (IEEE 802.3, the reflected @0xEDB88320@ polynomial — the same
--- checksum zlib computes).
+-- | CRC-32 (IEEE 802.3, reflected @0xEDB88320@, same as zlib).
 --
--- This is implemented here rather than pulled from @digest@ deliberately:
--- @digest@ binds to zlib, and requiring a C library to be present is exactly the
--- kind of friction that makes a package painful to install on Windows.
+-- Not using @digest@ because it needs zlib, which is a pain on Windows.
 --
--- It is the \"slicing-by-8\" variant: eight 256-entry tables let the inner loop
--- consume eight bytes per iteration with eight independent table lookups, rather
--- than one byte per iteration with a dependency on the previous step. Every
--- 'Database.Bitcask.get' checksums the record it reads, so this is on the read
--- path, and it is several times faster than the byte-at-a-time table. The tail
--- that does not fill a whole eight-byte step falls back to the classic loop.
+-- Slicing-by-8: eight tables, eight bytes per iteration with independent
+-- lookups. Every 'Database.Bitcask.get' checks a CRC, and this is several times
+-- faster than one byte at a time. The leftover tail uses the byte loop.
 module Database.Bitcask.Internal.CRC32
   ( crc32
   , crc32Update
@@ -32,14 +26,12 @@ import System.IO.Unsafe (unsafeDupablePerformIO)
 crc32 :: BS.ByteString -> Word32
 crc32 = crc32Update 0
 
--- | Continue a CRC-32 over another chunk, so a checksum can be computed
--- incrementally while streaming bytes out to a file.
+-- | Continue a CRC-32 over another chunk.
 crc32Update :: Word32 -> BS.ByteString -> Word32
 crc32Update seed bs =
   unsafeDupablePerformIO . BSU.unsafeUseAsCStringLen bs $ \(p, n) -> crc32Ptr seed (castPtr p) n
 
--- | 'crc32Update' over raw memory, for checksumming a buffer while it is being
--- built.
+-- | 'crc32Update' over raw memory.
 crc32Ptr :: Word32 -> Ptr Word8 -> Int -> IO Word32
 crc32Ptr seed p n = do
   let !mid = p `plusPtr` (n - n `rem` 8)
@@ -84,8 +76,8 @@ le32 p = do
   pure $! if targetByteOrder == LittleEndian then w else byteSwap32 w
 {-# INLINE le32 #-}
 
--- | The eight tables, back to back. Table 0 is the classic byte-at-a-time table;
--- table @k@ advances a byte through @k@ further zero bytes.
+-- | The eight tables, back to back. Table 0 is the usual byte table; table @k@
+-- advances a byte through @k@ more zero bytes.
 tables :: PrimArray Word32
 tables = primArrayFromListN (8 * 256) (concat (take 8 (iterate next t0)))
   where

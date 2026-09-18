@@ -3,15 +3,15 @@ name:               bitcask
 version:            0.1.0.0
 synopsis:           A log-structured hash table for fast key/value data
 description:
-    An implementation of the storage model described in Sheehy & Smith,
+    The storage model from Sheehy & Smith,
     /Bitcask: A Log-Structured Hash Table for Fast Key\/Value Data/.
     .
-    A store is a directory of append-only data files with an in-memory index, so
-    a read costs one hash lookup and one positional read, and a write costs one
-    append. The price is memory: every key in the store lives in RAM.
+    A store is a directory of append-only data files with an in-memory index.
+    A read is one hash lookup and one positional read, a write is one append.
+    Every key is kept in RAM.
     .
-    See "Database.Bitcask" to get started, and @DESIGN.md@ for why the format and
-    the concurrency model look the way they do.
+    Start with "Database.Bitcask". @DESIGN.md@ covers the format and
+    concurrency model.
 
 license:            MIT
 license-file:       LICENSE
@@ -58,7 +58,7 @@ library
         Database.Bitcask.Internal.Record
         Database.Bitcask.Internal.Store
 
-    -- Per-OS, and genuinely a different module on each, so it is not exposed.
+    -- Different module per OS, so not exposed.
     other-modules:
         Database.Bitcask.Internal.Platform
 
@@ -118,8 +118,8 @@ benchmark bitcask-bench
     type:            exitcode-stdio-1.0
     hs-source-dirs:  bench
     main-is:         Main.hs
-    -- One capability: the per-operation numbers are for a single thread, and
-    -- idle capabilities only add GC synchronisation noise.
+    -- One capability. The numbers are single-threaded and idle capabilities
+    -- just add GC sync noise.
     ghc-options:     -O2 -rtsopts "-with-rtsopts=-A32m"
     build-depends:
         base,
@@ -132,9 +132,8 @@ benchmark bitcask-bench
         temporary         >=1.3  && <1.4,
         text
 
--- An end-to-end workload to profile against; see "Profiling" in README.md.
--- A benchmark rather than an executable so that installing the library does not
--- install it.
+-- End-to-end workload for profiling; see "Profiling" in README.md.
+-- A benchmark so installing the library doesn't install it.
 benchmark bitcask-workload
     import:          extensions, ghc-options, rts-options
     type:            exitcode-stdio-1.0

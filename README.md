@@ -1,14 +1,13 @@
 # bitcask
 
-A Haskell implementation of the storage model in Sheehy & Smith,
+Haskell implementation of Sheehy & Smith,
 [*Bitcask: A Log-Structured Hash Table for Fast Key/Value Data*][paper].
 
-A store is a directory of append-only data files with an in-memory index, so a
-read costs one hash lookup and one positional read, and a write costs one append.
+A store is a directory of append-only data files with an in-memory index. A
+read is one hash lookup and one positional read. A write is one append.
 
-**Every key in the store lives in RAM, permanently.** That is the trade Bitcask
-makes, and it is the first thing to check against your data: a store with a
-hundred million small keys is not a Bitcask.
+**Every key is kept in RAM.** If you have a hundred million small keys, this
+is the wrong tool.
 
 ```haskell
 {-# LANGUAGE DerivingVia, DeriveAnyClass, DeriveGeneric, TypeApplications #-}
@@ -29,42 +28,39 @@ main = withBitcask @Text @User "users" defaultOptions $ \bc -> do
   print =<< get bc "nano"
 ```
 
-Keys and values are any types with a `Codec` instance. Derive one from a
-serialisation library you already use — `AsSerialize` is built in for `cereal`
-— or write the two methods yourself. `Database.Bitcask.Raw` is the
-same store at plain `ByteString`s.
+Keys and values can be any type with a `Codec` instance. Derive one from a
+serialisation library (`AsSerialize` is included for `cereal`) or write the two
+methods yourself. `Database.Bitcask.Raw` is the same store over plain
+`ByteString`s.
 
-## What it does
+## Features
 
 * `get`, `put`, `delete`, `member`, `keys`, `fold`, `sync`, `merge`, `stats`.
 * Reads take no lock; writes are serialised; `merge` blocks neither.
-* One process may hold a store open for writing, enforced by a lock on the
-  directory that the OS releases if the process dies.
-* A torn write at the end of the newest data file is repaired on open. Corruption
-  anywhere else is reported rather than skipped.
-* Hint files make reopening a large store fast; they are pure cache and can be
-  deleted.
+* One writer process at a time, enforced by a directory lock that the OS
+  releases if the process dies.
+* A torn write at the end of the newest data file is repaired on open. Other
+  corruption throws.
+* Hint files make reopening fast. They're just a cache and can be deleted.
 
-## What it does not do
+## Limitations
 
-* No transactions and no atomic batches. Bitcask has no commit record.
-* No ordered iteration. The index is a hash table.
-* Keys are capped at 64 KiB and values at 4 GiB.
+* No transactions or atomic batches.
+* No ordered iteration; the index is a hash table.
+* Keys max out at 64 KiB, values at 4 GiB.
 
 ## Durability
 
-The default `SyncPolicy` is `SyncNever`, which matches the paper. Records reach
-the operating system as they are written, but survive a machine crash only once
-`sync` has run; `withBitcask` and `close` sync on the way out. Set `syncPolicy`
-if you need more.
+The default `SyncPolicy` is `SyncNever`, same as the paper. Writes reach the OS
+immediately but only survive a machine crash after `sync`. `withBitcask` and
+`close` sync on exit. Set `syncPolicy` if you need more.
 
-A write that returns has happened; a write that throws has not, and a write cut
-short by `timeout` or `killThread` either happened or did not. The exceptions are
-failures that leave the end of the data file in doubt — a failed `fsync`, or a
-failed append that could not be undone. Those mark the store broken: later
-writes fail with `StoreBroken` until it is closed and reopened, which repairs the
-file. Reads keep working throughout. The haddock for `Database.Bitcask` has the
-details.
+If a write returns, it happened. If it throws, it didn't. If it's interrupted
+by `timeout` or `killThread`, it either happened or didn't. The exception is a
+failed `fsync` or a failed append that can't be undone. Then the store is
+marked broken and writes throw `StoreBroken` until you close and reopen it,
+which repairs the file. Reads keep working. See the `Database.Bitcask` haddock
+for details.
 
 ## Build
 
@@ -76,17 +72,17 @@ $ cabal haddock --open
 
 ## Benchmarks
 
-`bitcask-bench` times the pure codecs (CRC, record and hint encoding) and the
-store operations (`put`, `get`, `fold`, `open`, `merge`) against a real store in
-a temporary directory. Nothing in it syncs, so it measures the library and the
-OS page cache, not the disk.
+`bitcask-bench` times the codecs (CRC, record and hint encoding) and the store
+operations (`put`, `get`, `fold`, `open`, `merge`) on a real store in a temp
+directory. Nothing syncs, so it measures the library and page cache, not the
+disk.
 
 ```
 $ cabal bench bitcask-bench
 ```
 
-To check a change for regressions, save a baseline first and compare against it;
-`--fail-if-slower` turns a slowdown into a failing exit code:
+To check for regressions, save a baseline and compare. `--fail-if-slower` exits
+non-zero on a slowdown:
 
 ```
 $ cabal bench bitcask-bench --benchmark-options='--csv before.csv'
@@ -98,47 +94,44 @@ $ cabal bench bitcask-bench --benchmark-options='--baseline before.csv --fail-if
 
 ## Profiling
 
-`bitcask-workload` runs one realistic session end to end: a bulk load, random
-reads from one and then several threads, overwrites, a fold, a merge, and two
-reopens (from hint files, then by scanning the data files). It prints the wall
-time and throughput of each phase, and the heap each reopened keydir holds.
+`bitcask-workload` runs a full session: bulk load, random reads from one then
+several threads, overwrites, a fold, a merge, and two reopens (from hint files,
+then by scanning). It prints wall time and throughput per phase, and the heap
+used by each reopened keydir.
 
 ```
 $ cabal run bitcask-workload -- 300000 100 4    # keys, value bytes, reader threads
 ```
 
-Profiling builds go in their own build directory so they do not invalidate the
-normal one. For a time and allocation profile by cost centre, written to
-`bitcask-workload.prof`:
+Use a separate build directory for profiling so it doesn't invalidate the
+normal build. Time and allocation profile, written to `bitcask-workload.prof`:
 
 ```
 $ cabal run bitcask-workload --builddir=dist-prof --enable-profiling --profiling-detail=late -- 300000 +RTS -p -RTS
 ```
 
-`late` cost centres are inserted after optimisation, so the profile describes the
-code that actually runs rather than a de-optimised copy of it.
+`late` inserts cost centres after optimisation, so you profile the optimised
+code.
 
-A heap profile by closure type needs no profiling build at all:
+Heap profile by closure type, no profiling build needed:
 
 ```
 $ cabal run bitcask-workload -- 300000 +RTS -hT -i0.05 -RTS
 $ hp2ps -c bitcask-workload.hp
 ```
 
-For GC statistics add `+RTS -s -RTS`, and for a timeline of threads and GC that
-can be opened in `ghc-events-analyze` or `eventlog2html`, `+RTS -l -RTS`.
+`+RTS -s -RTS` for GC stats, `+RTS -l -RTS` for an eventlog (`ghc-events-analyze`
+or `eventlog2html`).
 
-Two things worth knowing when reading the numbers. A `get` of a small value is
-one positional read, and the system call is almost all of its cost, so it tracks
-the OS more than this library. And the workload runs with `-N`: with many idle
-capabilities the parallel GC can cost more than it saves, which `+RTS -qg` or
-`-qn4` will show.
+Notes: a small `get` is one pread and the syscall is most of the cost, so it
+mostly measures the OS. The workload runs with `-N`, and with many idle
+capabilities the parallel GC can cost more than it saves; try `+RTS -qg` or
+`-qn4`.
 
 ## Design
 
-[`DESIGN.md`](DESIGN.md) is the record of why the format, the error handling and
-the concurrency model look the way they do, including where the implementation
-had to correct the design.
+[`DESIGN.md`](DESIGN.md) explains the format, error handling and concurrency
+model, and where the implementation diverged from the original design.
 
 [paper]: https://riak.com/assets/bitcask-intro.pdf
 # bitcask

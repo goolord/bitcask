@@ -1,9 +1,6 @@
--- | The same store at raw bytes, for when you have 'ByteString's already and do
--- not want the 'Codec' constraints in your signatures.
+-- | The store over plain 'ByteString's, without 'Codec' constraints.
 --
--- @'Raw'@ is not a different store: @'Codec' 'ByteString'@ is the identity, so a
--- 'Raw' handle and a typed one over the same directory see exactly the same
--- bytes.
+-- Same format as the typed API: @'Codec' 'ByteString'@ is the identity.
 module Database.Bitcask.Raw
   ( Raw
   , module Database.Bitcask

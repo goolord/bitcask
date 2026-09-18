@@ -1,10 +1,8 @@
--- | What happens to the store when a write does not finish.
+-- | Writes that fail or get interrupted.
 --
--- The invariant under test: the active data file holds exactly the writes that
--- succeeded, and the store's idea of where that file ends matches the file. A
--- write that is interrupted or fails must not break that, because every later
--- write records its location relative to it — and a store that got it wrong
--- would go on accepting writes and silently losing them.
+-- Checks that the active file holds exactly the successful writes and that the
+-- store's offset matches the file's end. If the offset drifts, later writes
+-- are recorded at the wrong place and silently lost.
 module Test.Bitcask.WriteSafety (tests) where
 
 import Control.Exception (IOException, SomeException, finally, try)
@@ -30,17 +28,17 @@ tests =
     "WriteSafety"
     [ testCase "an interrupted put never corrupts the ones after it" $
         withSystemTempDirectory "bitcask-interrupt" $ \dir -> do
-          -- Puts under timeouts short enough to land anywhere inside them,
-          -- including between the append and the bookkeeping that follows it.
+          -- Puts under short timeouts, so some land between the append and the
+          -- bookkeeping.
           done <- withBitcask dir defaultOptions $ \(bc :: Raw) -> do
             finished <- forM [0 .. interrupted - 1] $ \i -> do
               r <- timeout (i `mod` 40) (put bc (key "t" i) (val i))
               pure (maybe Nothing (const (Just i)) r)
-            -- Then plain puts, which must all land where the store says.
+            -- Then normal puts, which must all be readable.
             forM_ [0 .. plain - 1] $ \i -> put bc (key "p" i) (val i)
             checkAll bc (catMaybes finished)
             pure (catMaybes finished)
-          -- And the same again from disk.
+          -- Same again after reopening.
           withBitcask dir defaultOptions $ \(bc :: Raw) -> checkAll bc done
     , testCase "an interrupted put either happened or did not" $
         withSystemTempDirectory "bitcask-interrupt-atomic" $ \dir ->
@@ -69,9 +67,7 @@ tests =
             assertFailure ("plain put " <> show i <> " read back as " <> show (fmap (fmap BC.unpack) (either (\e -> Left (show (e :: BitcaskError))) Right other)))
 
 
--- | The failures a real disk only produces when it is full or failing, reached
--- through the store's fault hooks. These work below the typed API, on
--- "Database.Bitcask.Internal.Store", because that is where the hooks are.
+-- | Disk failures, via the fault hooks in "Database.Bitcask.Internal.Store".
 faultTests :: [TestTree]
 faultTests =
   [ testCase "a failed append is undone, and the store carries on" $
@@ -80,8 +76,8 @@ faultTests =
         S.injectFault st S.FaultDataWrite
         failed <- try (S.putRaw st "b" "2")
         assertIOError failed
-        -- Half of "b" reached the file and was cut off again, so this lands
-        -- where the store thinks it does.
+        -- Half of "b" was written and truncated, so this goes at the right
+        -- offset.
         S.putRaw st "c" "3"
         expect st [("a", Just "1"), ("b", Nothing), ("c", Just "3")]
         S.closeStore st
@@ -96,10 +92,10 @@ faultTests =
         assertBroken =<< try (S.deleteRaw st "a")
         assertBroken =<< try (S.syncStore st)
         assertBroken =<< try (void (mergeStore st))
-        -- Reads are unaffected.
+        -- Reads still work.
         expect st [("a", Just "1"), ("b", Nothing)]
         S.closeStore st
-        -- Reopening scans the file, cuts off the half record and starts over.
+        -- Reopening scans the file and truncates the half record.
         reopened dir $ \st' -> do
           expect st' [("a", Just "1"), ("b", Nothing), ("c", Nothing)]
           S.putRaw st' "d" "4"
@@ -111,8 +107,8 @@ faultTests =
         S.injectFault st S.FaultSync
         assertIOError =<< try (S.putRaw st "b" "2")
         assertBroken =<< try (S.putRaw st "c" "3")
-        -- The record was written and indexed before the sync; whether it is
-        -- durable is what is unknown.
+        -- Written and indexed before the sync, so visible but maybe not
+        -- durable.
         expect st [("a", Just "1"), ("b", Just "2")]
         S.closeStore st
         reopened dir $ \st' -> do
@@ -128,30 +124,30 @@ faultTests =
   , testCase "a failed hint write costs the hint, never a write" $
       withRawStore $ \dir st -> do
         S.injectFault st S.FaultHintWrite
-        -- Enough entries to fill the hint buffer, so that it is flushed, and
-        -- the flush fails, part way through.
+        -- Enough entries to fill the hint buffer so the flush (and the fault)
+        -- happens mid-way.
         forM_ [0 .. hintFillers - 1] $ \i -> S.putRaw st (key "h" i) (val i)
         S.closeStore st
-        -- The store's only file lost its hint, so there is no hint at all.
+        -- The only file lost its hint.
         hints <- filter (".hint" `isSuffixOf`) <$> listDirectory dir
         hints @?= []
         reopened dir $ \st' -> forM_ [0 .. hintFillers - 1] $ \i ->
           S.getRaw st' (key "h" i) >>= (@?= Just (val i))
-  , -- The first sync a merge does finishes the active file it rolls away from.
+  , -- Merge's first sync is for the active file it rolls away from.
     testCase "a merge that cannot finish the active file does nothing" $
       mergeFailure (pure . snd) S.FaultSync
-  , -- On a freshly opened store the active file is empty, so merge does not roll
-    -- it, and the first sync is the one that finishes the merge output.
+  , -- After a fresh open the active file is empty so merge doesn't roll, and
+    -- the first sync is the merge output's.
     testCase "a merge whose output cannot be synced removes nothing" $
       mergeFailure reopenFirst S.FaultSync
-  , -- Likewise, the first data write is the merge's first block of output.
+  , -- Same, but the first data write is merge's first output block.
     testCase "a merge whose output write fails removes nothing" $
       mergeFailure reopenFirst S.FaultDataWrite
   ]
   where
-    -- Overwrite 100 keys, so that a merge has inputs; optionally reopen; arm a
-    -- fault; merge. The merge must fail and leave every value where it was,
-    -- both now and after a reopen.
+    -- Overwrite 100 keys so merge has inputs, maybe reopen, arm a fault, merge.
+    -- The merge must fail and every value must be intact, before and after a
+    -- reopen.
     mergeFailure prepare f = withSystemTempDirectory "bitcask-faults" $ \dir -> do
       st0 <- S.openStore dir defaultOptions
       forM_ [0 .. 199 :: Int] $ \i -> S.putRaw st0 (key "m" (i `mod` 100)) (val i)
@@ -172,8 +168,7 @@ faultTests =
     latest st = forM_ [0 .. 99 :: Int] $ \i ->
       S.getRaw st (key "m" i) >>= (@?= Just (val (i + 100)))
 
-    -- Hint entries here are 23 bytes plus the key; this is comfortably more
-    -- than one 64 KiB buffer's worth.
+    -- Hint entries are 23 bytes plus the key; this is well over 64 KiB.
     hintFillers = 5000 :: Int
 
     withRawStore act = withSystemTempDirectory "bitcask-faults" $ \dir -> do

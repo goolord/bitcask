@@ -1,27 +1,24 @@
 -- | Windows implementation of the platform layer.
 --
--- Same interface as the POSIX module under @lib-posix@; cabal picks one by
--- @os(windows)@. See @DESIGN.md@ §2.
+-- Same interface as @lib-posix@; cabal picks one with @os(windows)@. See
+-- @DESIGN.md@ §2.
 --
--- Three notes on how this differs, because the differences are the whole reason
--- this module exists:
+-- Differences from POSIX:
 --
--- * __Positional reads__ go through a raw Win32 @HANDLE@ and @ReadFile@ with
---   the offset in an @OVERLAPPED@ structure. Windows has no @pread@, but that is
---   its equivalent: each call names its own offset, so nothing depends on the
---   handle's shared file pointer. A GHC 'Handle' is not an option here — see
+-- * __Positional reads__ use a raw Win32 @HANDLE@ and @ReadFile@ with the
+--   offset in an @OVERLAPPED@. That's the Windows @pread@: the offset is per
+--   call, not the handle's file pointer. A GHC 'Handle' doesn't work here; see
 --   'ReadHandle'.
 --
--- * __Deleting a merged-away file__ that a reader still holds open works, as on
---   POSIX, because every read handle is opened with @FILE_SHARE_DELETE@. If a
---   delete fails anyway (another process has the file open, say), 'removeOpen'
---   reports 'False' instead of throwing, and the caller records the file in
---   @bitcask.pending@ and sweeps it at the next open. That fallback is slow —
---   @removeFile@ retries a sharing violation for about two seconds before giving
---   up — which is why it must not be the common path.
+-- * __Deleting a merged file__ while a reader has it open works because read
+--   handles are opened with @FILE_SHARE_DELETE@. If a delete still fails (e.g.
+--   another process has it open), 'removeOpen' returns 'False' and the caller
+--   adds the file to @bitcask.pending@ for the next open. That path is slow
+--   (@removeFile@ retries sharing violations for about two seconds), so it
+--   shouldn't be the common case.
 --
--- * __There is no directory sync__, and none is needed: @FlushFileBuffers@ on the
---   file handle is the durability primitive, so 'syncDir' is a no-op.
+-- * __No directory sync.__ @FlushFileBuffers@ on the file is enough, so
+--   'syncDir' is a no-op.
 module Database.Bitcask.Internal.Platform
   ( platformName
   , ReadHandle
@@ -80,18 +77,16 @@ platformName = "windows"
 
 -- | A data file opened for reading. Safe to share across threads.
 --
--- This is raw Win32 @HANDLE@s, not a GHC 'Handle', on purpose. GHC enforces
--- its own single-writer/multi-reader lock per file within a process, so a
--- read-mode 'Handle' on the active file is refused ("resource busy") while its
--- append handle is open, and every 'get' of a freshly written key would fail.
+-- Raw Win32 @HANDLE@s, not a GHC 'Handle'. GHC has its own per-file
+-- single-writer/multi-reader lock, so opening the active file for reading
+-- fails ("resource busy") while it's open for append, and 'get' on a freshly
+-- written key would fail.
 --
--- And it is several handles, not one. Windows serialises I\/O on a handle that
--- was opened for synchronous access: two threads reading through the same
--- handle at once take turns, however independent their offsets. With one handle
--- per file, adding reader threads made reads /slower/. So each file gets a small
--- pool, and a read uses the one belonging to the capability it runs on; since a
--- capability runs one Haskell thread at a time and these reads are @unsafe@
--- calls, two reads on the same capability never overlap.
+-- Windows serialises I\/O on a synchronous handle, so threads sharing one
+-- handle take turns. With one handle per file, more reader threads made reads
+-- slower. So each file gets one handle per capability. A capability runs one
+-- Haskell thread at a time and the reads are @unsafe@ calls, so reads on the
+-- same handle never overlap.
 data ReadHandle = ReadHandle !FilePath !(SmallArray HANDLE)
 
 openRead :: FilePath -> IO ReadHandle
@@ -114,25 +109,24 @@ openRead p = do
           fILE_ATTRIBUTE_NORMAL
           Nothing
       go (k - 1) (h : acc)
-    -- Do not leak the handles already opened if a later one fails.
+    -- Close the ones already opened if a later one fails.
     onException' acc act = act `onException` mapM_ closeHandle acc
 
--- | The most handles one file is opened with for reading.
+-- | Max read handles per file.
 maxReadHandles :: Int
 maxReadHandles = 16
 
--- | The handle for the capability the calling thread is on.
+-- | The handle for the current capability.
 pickHandle :: SmallArray HANDLE -> IO HANDLE
 pickHandle hs = do
   (cap, _) <- threadCapability =<< myThreadId
   pure $! indexSmallArray hs (cap `rem` sizeofSmallArray hs)
 {-# INLINE pickHandle #-}
 
--- | Read @n@ bytes at an absolute offset. Returns fewer bytes at end of file.
+-- | Read @n@ bytes at an offset. Returns fewer at end of file.
 --
--- Every @ReadFile@ carries its own offset in an @OVERLAPPED@, so no call relies
--- on the handle's shared file pointer and concurrent reads on one handle do not
--- interfere with each other.
+-- The offset goes in the @OVERLAPPED@, so the handle's file pointer isn't used
+-- and concurrent reads don't interfere.
 preadAt :: ReadHandle -> Word64 -> Int -> IO ByteString
 preadAt (ReadHandle _ hs) off n
   | n <= 0 = pure BS.empty
@@ -155,18 +149,18 @@ readChunkAt h off buf n =
       then fromIntegral <$> peek pDone
       else do
         err <- getLastError
-        -- A synchronous read that starts at or past the end fails with
-        -- ERROR_HANDLE_EOF rather than reading zero bytes.
+        -- A read at or past EOF fails with ERROR_HANDLE_EOF instead of
+        -- returning zero bytes.
         if err == eRROR_HANDLE_EOF then pure 0 else failWith "ReadFile" err
   where
     eRROR_HANDLE_EOF = 38
 
--- | The largest single @ReadFile@ or @WriteFile@ we issue; the length is a
--- 'DWORD', and callers loop.
+-- | Max bytes per @ReadFile@ or @WriteFile@. The length is a 'DWORD'; callers
+-- loop.
 maxChunk :: Int
 maxChunk = 0x40000000
 
--- | An @OVERLAPPED@ naming a file offset, and a 'DWORD' for the byte count, in
+-- | An @OVERLAPPED@ with a file offset, plus a 'DWORD' for the byte count, in
 -- one allocation.
 --
 -- @OVERLAPPED@ is @{ ULONG_PTR Internal, InternalHigh; DWORD Offset, OffsetHigh;
@@ -183,12 +177,10 @@ withOverlapped off act =
     offsetAt = 2 * ptrSize
     ovlSize = 3 * ptrSize + 8
 
--- These are @unsafe@ calls. A @safe@ call releases the capability so other
--- Haskell threads can run while it blocks, which is right for a call that may
--- block for a long time, and costs a few hundred nanoseconds per call for the
--- hand-off. A positional read or an append of a record is almost always served
--- by the page cache in a microsecond or two, so the hand-off would dominate.
--- The POSIX layer makes the same choice for @pread@.
+-- These are @unsafe@ calls. A @safe@ call releases the capability, which costs
+-- a few hundred ns. Reads and appends almost always hit the page cache and take
+-- a microsecond or two, so that overhead would dominate. The POSIX layer does
+-- the same for @pread@.
 foreign import ccall unsafe "windows.h ReadFile"
   c_ReadFile :: HANDLE -> Ptr Word8 -> DWORD -> Ptr DWORD -> Ptr () -> IO BOOL
 
@@ -203,12 +195,10 @@ closeRead (ReadHandle _ hs) = mapM_ closeHandle hs
 
 -- | A data file opened for appending. All writes are serialised by the caller.
 --
--- A raw @HANDLE@ for the same reason as 'ReadHandle', and one more: a write
--- through a GHC 'Handle' goes through the handle's lock and the I\/O manager,
--- which cost several times what the @WriteFile@ underneath does. There is no
--- buffering on this side at all: a record sitting in a user-space buffer would
--- be invisible to the separate read handles that 'preadAt' uses, so a 'get' of
--- a key that was just 'put' would miss it.
+-- A raw @HANDLE@ for the same reason as 'ReadHandle'. Also, writing through a
+-- GHC 'Handle' goes through its lock and the I\/O manager, which costs several
+-- times the @WriteFile@ itself. No buffering: 'preadAt' uses separate handles
+-- and wouldn't see buffered bytes, so a 'get' right after a 'put' would miss.
 newtype AppendHandle = AppendHandle HANDLE
 
 openAppend :: FilePath -> IO (AppendHandle, Word64)
@@ -235,9 +225,8 @@ openAppend p = do
 
 -- | Append at the end of the file.
 --
--- An @OVERLAPPED@ offset of all ones means \"the current end of file\", which is
--- the documented equivalent of opening with @FILE_APPEND_DATA@ — and unlike that
--- access right, it leaves the handle able to @FlushFileBuffers@.
+-- An @OVERLAPPED@ offset of all ones means end of file. Same as opening with
+-- @FILE_APPEND_DATA@, except the handle can still @FlushFileBuffers@.
 appendBytes :: AppendHandle -> ByteString -> IO ()
 appendBytes (AppendHandle h) bs =
   BSU.unsafeUseAsCStringLen bs $ \(p, len) -> go (castPtr p) len
@@ -249,18 +238,17 @@ appendBytes (AppendHandle h) bs =
         if ok then fromIntegral <$> peek pDone else failWith "WriteFile" =<< getLastError
       go (p `plusPtr` done) (len - done)
 
--- | Ask the OS to commit everything written through this handle.
+-- | Flush everything written through this handle to disk.
 syncFile :: AppendHandle -> IO ()
 syncFile (AppendHandle h) = flushFileBuffers h
 
 closeAppend :: AppendHandle -> IO ()
 closeAppend (AppendHandle h) = closeHandle h
 
--- | Cut the file back to @n@ bytes, undoing an append that failed part-way.
+-- | Truncate to @n@ bytes, to undo a partial append.
 --
--- @SetEndOfFile@ truncates at the file pointer, so the pointer is moved there
--- first. Nothing else uses the pointer: 'appendBytes' always writes at the
--- end of the file, wherever that now is.
+-- @SetEndOfFile@ truncates at the file pointer, so move it first. Nothing else
+-- uses the pointer; 'appendBytes' always writes at the end.
 truncateAppend :: AppendHandle -> Word64 -> IO ()
 truncateAppend (AppendHandle h) n = do
   moved <- c_SetFilePointerEx h (fromIntegral n) nullPtr 0 -- FILE_BEGIN
@@ -288,12 +276,11 @@ data LockMode = LockExclusive | LockShared
 
 newtype LockHandle = LockHandle HANDLE
 
--- | Take the store lock, or report that someone else holds it.
+-- | Take the store lock, or report that someone else has it.
 --
--- An exclusive @CreateFile@ with a share mode of zero /is/ the lock, and Windows
--- releases it when the process exits — the same self-healing property the POSIX
--- side gets from an advisory @fcntl@ lock. Windows will not tell us which
--- process holds the file, hence the 'Nothing'.
+-- A @CreateFile@ with share mode zero is the lock. Windows releases it when
+-- the process exits, like @fcntl@ locks on POSIX. Windows doesn't say who holds
+-- it, hence the 'Nothing'.
 takeLock :: FilePath -> LockMode -> IO (Either (Maybe Word32) LockHandle)
 takeLock p mode = do
   r <-
@@ -317,8 +304,8 @@ takeLock p mode = do
 dropLock :: LockHandle -> IO ()
 dropLock (LockHandle h) = closeHandle h
 
--- | Remove a file that readers may still have open. Unlike POSIX, this fails on
--- Windows while any handle is open; the caller falls back to @bitcask.pending@.
+-- | Remove a file that readers may still have open. Returns 'False' instead of
+-- throwing if it fails; the caller falls back to @bitcask.pending@.
 removeOpen :: FilePath -> IO Bool
 removeOpen p = do
   r <- try (removeFile p)

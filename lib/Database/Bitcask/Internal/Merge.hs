@@ -1,28 +1,21 @@
 -- | Merge: rewrite the immutable data files keeping only live records.
 --
--- Merge runs concurrently with readers /and/ writers. It never takes the write
--- lock for longer than it takes to roll the active file, and it never blocks a
--- read at all. Two things make that work.
+-- Merge runs alongside readers and writers. It only holds the write lock long
+-- enough to roll the active file, and never blocks reads.
 --
--- The first is the compare-on-location update. When merge copies a record it
--- installs the new location with 'atomicModifyIORef'' only if the keydir still
--- points at the old one. A 'Database.Bitcask.put' that raced the merge has
--- already moved the entry, so the compare fails and the copied record is simply
--- dead on arrival.
+-- Copied records are installed with a compare-on-location update: the keydir
+-- is only changed if it still points at the old location. If a
+-- 'Database.Bitcask.put' got there first, the copy is just dead.
 --
--- The second is file id allocation. Merge output holds records that are /older/
--- than anything written while the merge was running, so on the next open it has
--- to replay first. Data file ids are a @(base, sub)@ pair for exactly this
--- reason: merge allocates @(base of the newest input, next sub)@, which sorts
--- after every input and strictly before the active file. A single flat counter
--- has no id to give it, and the store would come back from a restart with stale
--- values. See @DESIGN.md@ §3.1.
+-- Merge output holds records older than anything written during the merge, so
+-- it has to be replayed first on open. That's why file ids are @(base, sub)@:
+-- merge uses @(base of newest input, next sub)@, which sorts after all inputs
+-- and before the active file. With a flat counter there'd be no id that works,
+-- and a restart would bring back stale values. See @DESIGN.md@ §3.1.
 --
--- v1 merges every immutable file at once, which is what makes dropping
--- tombstones trivially correct: a tombstone can only be dropped once no older
--- file can still hold a value for that key, and after a full merge there are no
--- older files. Merging a subset is a later refinement and needs tombstone
--- retention rules.
+-- Every immutable file is merged at once. That makes dropping tombstones safe,
+-- since no older file can still have a value for the key. Partial merges would
+-- need tombstone retention rules.
 module Database.Bitcask.Internal.Merge
   ( mergeStore
   , shouldMerge
@@ -48,7 +41,7 @@ import Database.Bitcask.Internal.Record (Record (..), decodeRecord)
 import Database.Bitcask.Internal.Store
 import Database.Bitcask.Types
 
--- | Should the automatic merge policy fire?
+-- | Whether 'MergeAuto' should run a merge now.
 shouldMerge :: Store -> IO Bool
 shouldMerge st = case mergePolicy (stOpts st) of
   MergeManual -> pure False
@@ -67,9 +60,8 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
   assertOpen st
   when (readOnly (stOpts st)) $ throwIO WriteToReadOnly
 
-  -- Roll first, so that every file we are about to read is immutable for the
-  -- whole merge. This is the only point where merge touches the write path.
-  -- A broken store refuses this like any other write.
+  -- Roll first so every input stays immutable for the whole merge. This is the
+  -- only time merge touches the write path. Fails on a broken store.
   activeFid <- withActive st $ \ac ->
     if acOffset ac > 0
       then do
@@ -89,19 +81,16 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
           usedSubs = [fileSub f | f <- allFids, fileBase f == outBase]
           firstSub = if null usedSubs then 1 else maximum usedSubs + 1
 
-      -- Every live record that still lives in an input file. Reading the keydir
-      -- rather than scanning the inputs means dead records and tombstones are
-      -- never even looked at.
+      -- Live records in the input files. Going from the keydir instead of
+      -- scanning the inputs skips dead records and tombstones.
       --
-      -- They are read with 'sweepRecords', which visits them roughly in file
-      -- and offset order a window at a time. The keydir is a hash table, so its
-      -- own order is random, and reading the inputs in it would turn a sequential
-      -- pass over each file into a random read per record.
+      -- 'sweepRecords' reads them roughly in file order. Keydir order is
+      -- random, which would mean a random read per record.
       kd <- readIORef (stKeydir st)
       let todo = [(k, l) | (k, l) <- KD.toList kd, locFileId l `Set.member` inputSet]
 
-      -- The output file currently open, if any, so that a merge that fails part
-      -- way can close it; see 'abandonOutput'.
+      -- The open output file, so a failed merge can close it; see
+      -- 'abandonOutput'.
       current <- newIORef Nothing
       out <-
         ( do
@@ -116,10 +105,9 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
         )
           `onException` (readIORef current >>= mapM_ (abandonOutput st))
 
-      -- The output is durable, or 'finishOutput' would have thrown, and the
-      -- inputs are left alone. Nothing in the keydir can reference an input any
-      -- more: new writes only ever land in the active file, so every reference
-      -- either moved above or was superseded while we worked.
+      -- The output is durable ('finishOutput' throws otherwise). Nothing in the
+      -- keydir points at an input now: every entry was either moved above or
+      -- overwritten by a write to the active file.
       removeInputs st inputs
 
       pure
@@ -129,16 +117,14 @@ mergeStore st = withMVar (stMergeGate st) $ \() -> do
           , reclaimedBytes = reclaimable
           }
 
--- | The merge output, and the copies written to it that are not yet visible.
+-- | The merge output and the copies not yet written to it.
 --
--- Copied records are written in blocks rather than one at a time, for the same
--- reason reads are swept: the system call per record, not the copying, is what a
--- record-at-a-time merge spends its time on. A copy must be on disk before the
--- keydir is pointed at it, so the keydir claims for a block are made when the
--- block is written, all in one update.
+-- Copies are written in blocks since the per-record syscall dominates
+-- otherwise. A copy has to be written before the keydir points at it, so each
+-- block's claims are applied in one update right after the block is written.
 data Out = Out
   { outActive :: !Active
-  -- ^ its offset already counts the pending bytes
+  -- ^ offset includes the pending bytes
   , outPending :: ![Claim]
   -- ^ newest first
   , outPendingBytes :: ![ByteString]
@@ -147,20 +133,20 @@ data Out = Out
   , outCopied :: !Int
   }
 
--- | Move a key from one location to another, if it is still at the first.
+-- | Move a key from one location to another if it's still at the first.
 data Claim = Claim !ByteString !Loc !Loc
 
 -- | Copy one live record into the merge output.
 copyOne :: Store -> IORef (Maybe Active) -> Out -> ByteString -> Loc -> Maybe ByteString -> IO Out
 copyOne st current out0 k loc swept = do
-  -- A sweep read that failed or came up short gets one careful retry on its
-  -- own; that one is allowed to throw.
+  -- If the sweep read failed or was short, retry this record on its own. That
+  -- one can throw.
   bytes <- case swept of
     Just b -> pure b
     Nothing -> withReader st (locFileId loc) $ \rh ->
       preadAt rh (locPos loc) (fromIntegral (locSize loc))
   if BS.length bytes < fromIntegral (locSize loc)
-    then pure out0 -- the entry went stale under us; the newer write wins
+    then pure out0 -- stale entry; the newer write wins
     else case decodeRecord (verifyChecksums (stOpts st)) bytes of
       Left err -> throwIO (CorruptRecord (dataPath (stDir st) (locFileId loc)) (locPos loc) err)
       Right r
@@ -208,9 +194,8 @@ flushOut st out
       let ac = outActive out
           fid = acFileId ac
       appendData st (acData ac) (BS.concat (reverse (outPendingBytes out)))
-      -- Compare-on-location: install each new place only if nobody moved the key
-      -- while we were copying it. A put that got there first wins, and the copy
-      -- is dead on arrival.
+      -- Only move keys that haven't changed since we copied them. If a put got
+      -- there first, the copy is dead.
       lost <- atomicModifyIORef' (stKeydir st) $ \kd0 ->
         let claim (kd, dead) (Claim k old new) = case KD.replaceIf k old new kd of
               (kd', True) -> (kd', dead)
@@ -220,12 +205,12 @@ flushOut st out
       when (lost > 0) $ bumpDead st fid lost
       pure out {outPending = [], outPendingBytes = [], outPendingLen = 0}
 
--- | How much copied data merge collects before writing it out.
+-- | How much copied data to buffer before writing.
 mergeBlockSize :: Int
 mergeBlockSize = 256 * 1024
 
--- | Roll the merge output to the next sub-sequence id at the same base, which
--- keeps it sorting before the active file.
+-- | Roll the merge output to the next sub id at the same base, so it still
+-- sorts before the active file.
 rollMergeOutput :: Store -> IORef (Maybe Active) -> Active -> IO Active
 rollMergeOutput st current out = do
   finishOutput st current out
@@ -238,10 +223,10 @@ rollMergeOutput st current out = do
   bumpTotal st next 0
   pure out'
 
--- | Finish a merge output file, throwing if it could not be made durable.
+-- | Finish a merge output file. Throws if it couldn't be synced.
 --
--- It is forgotten before it is closed: 'closeActive' closes its handles whatever
--- happens, and 'abandonOutput' must not close them a second time.
+-- Cleared from @current@ before closing, since 'closeActive' always closes the
+-- handles and 'abandonOutput' mustn't close them again.
 finishOutput :: Store -> IORef (Maybe Active) -> Active -> IO ()
 finishOutput st current out = do
   failed <- mask_ $ do
@@ -251,12 +236,10 @@ finishOutput st current out = do
 
 -- | Close a merge output after the merge failed.
 --
--- Its records up to the last block written are real and some are already in the
--- keydir, so the data file stays. The hint file goes, unfinished: entries are
--- added to it ahead of the block their records are written in, so it may
--- describe records that never reached the data file. Without a hint the next
--- open scans the file, which stops cleanly at whatever the failure left at the
--- end.
+-- The data file stays, since some of its records are already in the keydir.
+-- The hint file is deleted: hint entries are added before their block is
+-- written, so it may list records that never made it. Without a hint, the next
+-- open scans the file and stops at the bad tail.
 abandonOutput :: Store -> Active -> IO ()
 abandonOutput st out = do
   quietly (closeAppend (acHint out))
@@ -266,16 +249,13 @@ abandonOutput st out = do
   where
     quietly act = void (try act :: IO (Either SomeException ()))
 
--- | Retire the merged-away files.
+-- | Delete the merged input files.
 --
--- Their read handles are /not/ closed here. A reader may be inside a positional
--- read on one right now, and closing the descriptor under it would at best fail
--- and at worst read a recycled descriptor. They are retired from the lookup map
--- and closed when the store closes.
+-- Read handles aren't closed here since a reader could be mid-pread; see
+-- 'retireReader'. They're closed when the store closes.
 --
--- On POSIX the unlink then succeeds regardless, because the inode outlives the
--- last descriptor. On Windows it does not, so the file id goes into
--- @bitcask.pending@ and is swept at the next open.
+-- On POSIX the unlink works anyway. On Windows it can fail, so the file id goes
+-- into @bitcask.pending@ and gets cleaned up on the next open.
 removeInputs :: Store -> [FileId] -> IO ()
 removeInputs st inputs = do
   stuck <- foldM removeOne [] inputs

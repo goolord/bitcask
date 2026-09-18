@@ -1,8 +1,5 @@
--- | The store handle and the operations on raw encoded bytes.
---
--- Everything here works in terms of already-encoded keys and values; the typed
--- layer in "Database.Bitcask" is a thin wrapper that encodes on the way in and
--- decodes on the way out.
+-- | The store handle and operations on encoded keys and values.
+-- "Database.Bitcask" wraps these with encoding and decoding.
 module Database.Bitcask.Internal.Store
   ( Store (..)
   , Active (..)
@@ -91,9 +88,8 @@ data Active = Active
 
 -- | Read handles for the data files, by id.
 --
--- The map is read without a lock, because every 'Database.Bitcask.get' needs a
--- handle and taking a lock there would serialise all readers on it. The lock is
--- only for changing the map, so that two threads that miss at once do not both
+-- Reads of the map are lock-free since every 'Database.Bitcask.get' needs one.
+-- The lock is only taken to insert, so two threads missing at once don't both
 -- open the file.
 data Readers = Readers
   { rdMap :: !(IORef (Map FileId ReadHandle))
@@ -113,8 +109,7 @@ data Store = Store
   , stTotal :: !(IORef (Map FileId Word64))
   -- ^ bytes written per data file
   , stDead :: !(IORef (Map FileId Word64))
-  -- ^ bytes per data file no longer reachable from the keydir; a heuristic that
-  -- only drives the merge trigger
+  -- ^ unreachable bytes per data file; only used for the merge trigger
   , stWrites :: !(IORef Int)
   , stMergeGate :: !(MVar ())
   -- ^ one merge at a time
@@ -122,7 +117,7 @@ data Store = Store
   , stRetired :: !(IORef [ReadHandle])
   -- ^ handles for files merge has removed; see 'retireReader'
   , stBroken :: !(IORef (Maybe String))
-  -- ^ why writes are refused, once they are; see 'markBroken'
+  -- ^ set once writes are refused; see 'markBroken'
   , stFaults :: !(IORef [Fault])
   -- ^ armed test faults; see 'Fault'
   }
@@ -142,10 +137,9 @@ assertOpen st = do
 
 -- | Open (or create) a store.
 --
--- A fresh active file is started on every open rather than appending to the
--- previous one. It costs one small file per open — merge folds them away — and
--- buys a simple invariant: a file that is not the active file is never appended
--- to again, so a torn tail can only ever exist at the end of one file.
+-- Every open starts a new active file instead of appending to the last one.
+-- That costs a small file per open (merge cleans them up), but it means only
+-- the active file is ever appended to, so a torn tail can only be in one place.
 openStore :: FilePath -> OpenOptions -> IO Store
 openStore dir opts = do
   createDirectoryIfMissing True dir
@@ -221,8 +215,8 @@ checkMeta dir opts = do
 
 -- | Rebuild the keydir, preferring hint files and falling back to a full scan.
 --
--- Files are visited in ascending id order, which is write order, so the last ref
--- for a key simply wins. See "Database.Bitcask.Internal.Keydir".
+-- Files are visited in id order, which is write order, so the last ref for a
+-- key wins. See "Database.Bitcask.Internal.Keydir".
 rebuild :: FilePath -> OpenOptions -> Readers -> [FileId] -> IO Keydir
 rebuild dir opts readers fids = foldM one KD.empty (zip fids (repeat ()))
   where
@@ -246,22 +240,21 @@ rebuild dir opts readers fids = foldM one KD.empty (zip fids (repeat ()))
           forM_ torn $ \at ->
             if repairTruncated opts && not (readOnly opts) && Just fid == lastFid
               then do
-                -- Only the newest file can hold a torn write, and only a writer
-                -- may repair it.
+                -- Only the newest file can have a torn write, and only a writer
+                -- repairs it.
                 closeReaderFor readers fid
                 truncateAt (dataPath dir fid) at
               else pure ()
           pure $! kd'
 
--- | The read handle for a file, opening it on first use. Lock-free when the
--- handle is already open, which is every time but the first.
+-- | The read handle for a file, opened on first use. Lock-free after that.
 cachedReader :: FilePath -> Readers -> FileId -> IO ReadHandle
 cachedReader dir rd fid = do
   m <- readIORef (rdMap rd)
   case M.lookup fid m of
     Just rh -> pure rh
     Nothing -> withMVar (rdLock rd) $ \() -> do
-      -- Someone may have opened it while we waited for the lock.
+      -- Another thread may have opened it while we waited.
       m' <- readIORef (rdMap rd)
       case M.lookup fid m' of
         Just rh -> pure rh
@@ -270,7 +263,7 @@ cachedReader dir rd fid = do
           atomicModifyIORef' (rdMap rd) (\m'' -> (M.insert fid rh m'', ()))
           pure rh
 
--- | Forget a file's read handle, handing it back if there was one.
+-- | Remove a file's read handle from the map and return it.
 dropReader :: Readers -> FileId -> IO (Maybe ReadHandle)
 dropReader rd fid = withMVar (rdLock rd) $ \() ->
   atomicModifyIORef' (rdMap rd) (\m -> (M.delete fid m, M.lookup fid m))
@@ -278,8 +271,8 @@ dropReader rd fid = withMVar (rdLock rd) $ \() ->
 closeReaderFor :: Readers -> FileId -> IO ()
 closeReaderFor rd fid = dropReader rd fid >>= mapM_ closeRead
 
--- | Delete files a previous merge could not remove because a reader still held
--- them open. Only Windows ever leaves these behind.
+-- | Delete files a previous merge couldn't remove because a reader had them
+-- open. Only happens on Windows.
 sweepPending :: FilePath -> IO ()
 sweepPending dir = do
   fids <- readPending dir
@@ -311,14 +304,12 @@ openActive dir fid = do
 
 -- | Add an entry to the active file's hint file.
 --
--- Hint entries are buffered and written in blocks, which saves the write path one
--- system call per record — roughly half of what a 'Database.Bitcask.put' costs.
--- Unlike the data file, nothing reads a hint file until the file is finished and
--- its trailer written, so there is nobody to see the difference; and a crash
--- that loses the buffer loses nothing, because a hint file without its trailer is
--- ignored in favour of scanning the data file.
+-- Entries are buffered and written in blocks. That saves a syscall per record,
+-- about half the cost of a 'Database.Bitcask.put'. Nothing reads a hint file
+-- until its trailer is written, and a hint file with no trailer is ignored on
+-- open, so losing the buffer in a crash is harmless.
 --
--- Throws nothing but asynchronous exceptions: see 'flushHint'.
+-- Only throws asynchronous exceptions; see 'flushHint'.
 appendHint :: Store -> Active -> ByteString -> IO Active
 appendHint st ac bytes
   | not (acHintOk ac) = pure ac
@@ -334,10 +325,9 @@ appendHint st ac bytes
 
 -- | Write out buffered hint entries.
 --
--- A hint file is a cache, so a failure to write one must never fail the write
--- that caused it. If a hint write fails the file is simply given up on: nothing
--- more is buffered for it, it gets no trailer, and it is deleted when the data
--- file is finished. The next open scans that data file instead.
+-- Hint files are a cache, so a failed hint write must not fail the put. On
+-- failure we give up on the hint: no more buffering, no trailer, and it's
+-- deleted when the data file is finished. The next open scans the data file.
 flushHint :: Store -> Active -> IO Active
 flushHint st ac
   | not (acHintOk ac) || null (acHintBuf ac) = pure ac
@@ -349,29 +339,22 @@ flushHint st ac
       case r of
         Right () -> pure ac {acHintBuf = [], acHintBufLen = 0}
         Left (e :: SomeException)
-          -- Only a failed write costs the hint. An asynchronous exception —
-          -- a merge thread being killed by 'closeStore', say — must go on
-          -- being delivered, or the thread would carry on as if nothing had
-          -- happened.
+          -- Rethrow async exceptions (e.g. 'closeStore' killing a merge
+          -- thread), otherwise the thread would just keep going.
           | Just (_ :: SomeAsyncException) <- fromException e -> throwIO e
           | otherwise -> pure ac {acHintBuf = [], acHintBufLen = 0, acHintOk = False}
 
 hintBufferSize :: Int
 hintBufferSize = 64 * 1024
 
--- | Finish a data file: sync it, cap its hint file with the trailer that makes
--- the hint usable, and close both.
+-- | Finish a data file: sync it, write the hint trailer, close both.
 --
--- This always closes both handles, even when something fails, so that nothing
--- ever tries to use or close them again. It reports a failure to make the data
--- durable rather than throwing it, having already marked the store broken; a
--- failure to finish the hint only costs the hint.
+-- Both handles are always closed. A failed data sync marks the store broken
+-- and is returned rather than thrown. A failed hint just loses the hint.
 --
--- The data is synced before the hint trailer is written, and a store that is
--- broken gets no trailer at all. A hint describes only the writes that
--- succeeded, so on a broken store it would be accurate — but it would also make
--- the next open trust the file without scanning it, and the scan is what finds
--- and repairs whatever a failed write left at the end.
+-- The data is synced before the trailer is written. A broken store gets no
+-- trailer: the hint would be accurate, but it would stop the next open from
+-- scanning the file, and the scan is what repairs a bad tail.
 closeActive :: Store -> Active -> IO (Maybe SomeException)
 closeActive st ac0 = do
   ac <- flushHint st ac0
@@ -387,10 +370,9 @@ closeActive st ac0 = do
       else pure False
   quietly (closeAppend (acHint ac))
   quietly (closeAppend (acData ac))
-  -- A hint without a trailer is ignored on open anyway; removing it just keeps
-  -- the directory honest.
+  -- A hint with no trailer is ignored on open anyway. Remove it to tidy up.
   unless hinted $ void (removeOpen (hintPath (stDir st) (acFileId ac)))
-  -- The directory entry for the new file is part of its durability too.
+  -- The new file's directory entry needs syncing too.
   dirSynced <- try (syncDir (stDir st))
   forM_ (leftToMaybe dirSynced) $ \e ->
     markBroken st ("sync of directory " <> stDir st <> " failed: " <> show e)
@@ -400,10 +382,9 @@ closeActive st ac0 = do
 
 -- | Roll to a fresh active file.
 --
--- The new file is opened /before/ the old one is closed, so that failing to
--- open it — no space, no file descriptors — leaves the old file active and the
--- store perfectly usable. Returns the file to carry on with, and the error if
--- there was one.
+-- The new file is opened before the old one is closed, so if the open fails
+-- (disk full, out of fds) the old file stays active and the store still works.
+-- Returns the active file to continue with and the error, if any.
 rollActive :: Store -> Active -> IO (Active, Maybe SomeException)
 rollActive st ac = do
   opened <- try (openActive (stDir st) (mkFileId (fileBase (acFileId ac) + 1) 0))
@@ -419,16 +400,14 @@ rollActive st ac = do
 
 -- | Run one step of the write path against the active file.
 --
--- The step runs with asynchronous exceptions masked. Without that, a
--- 'System.Timeout.timeout' or 'Control.Concurrent.killThread' landing between
--- an append and the bookkeeping after it would put the old 'Active' back while
--- the bytes stayed on disk, and every later write would record its location at
--- the wrong offset — silently, since the writes themselves would succeed.
+-- Async exceptions are masked. Otherwise a 'System.Timeout.timeout' or
+-- 'Control.Concurrent.killThread' between an append and its bookkeeping would
+-- restore the old 'Active' with the bytes still on disk, and every later write
+-- would silently record the wrong offset.
 --
--- The step reports failure by returning it, alongside the 'Active' that is now
--- true, because on failure the file may still have changed (it may have rolled)
--- and the MVar must hold what is actually there. A step that throws anyway has
--- hit something unforeseen, so the store is marked broken rather than trusted.
+-- The step returns its failure along with the current 'Active', since the file
+-- may have changed (e.g. rolled) even when the step failed. If the step throws
+-- instead, something unexpected happened and the store is marked broken.
 withActive :: Store -> (Active -> IO (Active, Either SomeException a)) -> IO a
 withActive st step = do
   r <- modifyMVarMasked (stActive st) $ \case
@@ -446,13 +425,12 @@ withActive st step = do
               pure (Just ac, Left e)
   either throwIO pure r
 
--- | Refuse all further writes, for the given reason. The first reason sticks.
+-- | Refuse all further writes. Keeps the first reason given.
 markBroken :: Store -> String -> IO ()
 markBroken st why = atomicModifyIORef' (stBroken st) (\b -> (b <|> Just why, ()))
 
--- | Append to a data file, in a way the tests can make fail: an armed
--- 'FaultDataWrite' writes half the bytes and then throws, which is the worst a
--- real failed write can do.
+-- | Append to a data file. With 'FaultDataWrite' armed, writes half the bytes
+-- and throws, which is the worst a real failed write can do.
 appendData :: Store -> AppendHandle -> ByteString -> IO ()
 appendData st h bytes = do
   injected <- fault st FaultDataWrite
@@ -462,15 +440,15 @@ appendData st h bytes = do
       throwIO (userError "injected fault: data write")
     else appendBytes h bytes
 
--- | @fsync@ a data file, in a way the tests can make fail.
+-- | @fsync@ a data file. Fails if 'FaultSync' is armed.
 syncData :: Store -> AppendHandle -> IO ()
 syncData st h = do
   injected <- fault st FaultSync
   when injected $ throwIO (userError "injected fault: sync")
   syncFile h
 
--- | Failures the test suite can arm, to reach the paths that a real disk only
--- takes when it is full or failing. Each fires once, at its next opportunity.
+-- | Failures the tests can arm to hit paths a real disk only takes when full
+-- or failing. Each fires once.
 data Fault
   = -- | an append to the active data file writes half the record, then fails
     FaultDataWrite
@@ -486,7 +464,7 @@ data Fault
 injectFault :: Store -> Fault -> IO ()
 injectFault st f = atomicModifyIORef' (stFaults st) (\fs -> (f : fs, ()))
 
--- | Whether a fault is armed, disarming it if so. Costs one read when none is.
+-- | Check and disarm a fault. One IORef read when nothing is armed.
 fault :: Store -> Fault -> IO Bool
 fault st f = do
   armed <- readIORef (stFaults st)
@@ -504,12 +482,11 @@ leftToMaybe = either Just (const Nothing)
 withReader :: Store -> FileId -> (ReadHandle -> IO a) -> IO a
 withReader st fid act = act =<< cachedReader (stDir st) (stReaders st) fid
 
--- | Stop handing out the read handle for a file, without closing it.
+-- | Stop handing out a file's read handle, but don't close it.
 --
--- Merge calls this for a file it is about to remove. Closing the descriptor here
--- would race a reader that is inside a positional read on it right now — at best
--- the read fails, at worst the descriptor has already been recycled. The handle
--- is parked instead and closed when the store closes.
+-- Merge calls this before removing a file. Closing here could race a reader
+-- mid-pread, which would fail or, worse, hit a recycled descriptor. The handle
+-- is kept and closed when the store closes.
 retireReader :: Store -> FileId -> IO ()
 retireReader st fid = do
   old <- dropReader (stReaders st) fid
@@ -528,11 +505,9 @@ getRaw st k = do
 
 -- | Read the record at a location and hand back its value.
 --
--- The retries exist because a location read out of the keydir can go stale under
--- a concurrent merge: the file may have been removed, or the offset may now hold
--- a different record. Both are detectable — a failed read, a short read, or a
--- record whose key is not the one we asked for — and the answer to all three is
--- to look the key up again.
+-- A location can go stale under a concurrent merge: the file may be gone, or
+-- the offset may hold a different record. That shows up as a failed read, a
+-- short read, or the wrong key, and in each case we look the key up again.
 fetchAt :: Store -> ByteString -> Loc -> Int -> IO (Maybe ByteString)
 fetchAt st k loc attempt = do
   res <- try (withReader st (locFileId loc) $ \rh -> preadAt rh (locPos loc) (fromIntegral (locSize loc)))
@@ -571,9 +546,8 @@ keysRaw st = do
 
 -- | Strict left fold over every live key and value.
 --
--- The keydir is snapshotted first, so the fold sees a consistent set of keys;
--- values are read as it goes, and a key deleted mid-fold is skipped rather than
--- reported.
+-- Folds over a snapshot of the keydir. Values are read as it goes, and a key
+-- deleted mid-fold is skipped.
 foldRaw :: Store -> (a -> ByteString -> ByteString -> IO a) -> a -> IO a
 foldRaw st f z = do
   assertOpen st
@@ -584,29 +558,24 @@ foldRaw st f z = do
       mv <- case decodeRecord (verifyChecksums (stOpts st)) <$> mbytes of
         Just (Right r)
           | recKey r == k, Just v <- recValue r ->
-              -- A copy, so that a caller holding on to values does not hold on
-              -- to the whole read window each one was sliced from.
+              -- Copy so a retained value doesn't retain the whole read window.
               pure (Just (BS.copy v))
-        -- Anything unexpected goes the slow way, which knows how to retry
-        -- around a concurrent merge and how to report real corruption.
+        -- Otherwise take the slow path, which retries around a concurrent
+        -- merge and reports real corruption.
         _ -> fetchAt st k loc 0
       maybe (pure acc) (f acc k) mv
 
--- | Visit the records at a set of locations, reading each file in large
--- windows instead of making one positional read per record.
+-- | Visit the records at a set of locations, reading files in large windows
+-- instead of one pread per record.
 --
--- A positional read costs a system call whatever its size, and for the ~100-byte
--- records Bitcask is built for the call is nearly all of the cost. So the
--- locations are bucketed by file and by which 'sweepWindow'-sized stretch of the
--- file they start in, each bucket is fetched with a single read spanning its
--- records, and the records are sliced out of that. Buckets are visited in file
--- and offset order, so each file is read front to back; within a bucket the
--- order is unspecified. Bucketing rather than sorting matters: sorting every
--- live key by location cost more than all the reads it saved.
+-- For small records the syscall is most of the cost of a read. Locations are
+-- bucketed by file and by which 'sweepWindow' chunk they start in, and each
+-- bucket is fetched with one read. Buckets go in file and offset order; order
+-- within a bucket is unspecified. We bucket instead of sorting because sorting
+-- every live key by location cost more than the reads it saved.
 --
--- The callback gets exactly the record's bytes, or 'Nothing' if the read failed
--- or came up short; it decides what to do about that, typically by falling back
--- to the careful per-record path.
+-- The callback gets the record's bytes, or 'Nothing' if the read failed or was
+-- short. Callers usually fall back to the per-record path then.
 sweepRecords
   :: Store
   -> (a -> ByteString -> Loc -> Maybe ByteString -> IO a)
@@ -635,12 +604,11 @@ sweepRecords st f z items = foldM bucket z (M.toAscList buckets)
         o = fromIntegral (locPos l - start)
         n = fromIntegral (locSize l)
 
--- | How much of a file one sweep read covers: records are bucketed by which
--- stretch of this size they start in.
+-- | Bucket size for 'sweepRecords'.
 sweepWindow :: Word64
 sweepWindow = 1024 * 1024
 
--- | Fold over keys and locations without reading, or decoding, any values.
+-- | Fold over keys and locations without reading any values.
 foldRefsRaw :: Store -> (a -> ByteString -> Loc -> IO a) -> a -> IO a
 foldRefsRaw st f z = do
   assertOpen st
@@ -660,21 +628,17 @@ deleteRaw st k = appendRecord st k Nothing
 
 -- | Append one record and point the keydir at it.
 --
--- What a caller can rely on, however this ends:
+-- * Returns: the record is in the file and visible to readers.
 --
--- * If it returns, the record is in the file and visible to readers.
+-- * Append fails: the file is truncated back and the call throws. The write
+--   didn't happen and the store is fine.
 --
--- * If the append fails, the file is cut back to where it was and the call
---   throws: the write did not happen, and the store carries on.
+-- * Truncate fails, or an @fsync@ required by the 'SyncPolicy' fails: throws
+--   and marks the store broken, so later writes fail with 'StoreBroken' until
+--   reopened. A failed @fsync@ happens after the record is indexed, so it's
+--   visible now and may or may not survive a reopen.
 --
--- * If the append fails and the file cannot be cut back, or an @fsync@ that the
---   'SyncPolicy' asked for fails, the call throws and the store is marked
---   broken: every later write fails with 'StoreBroken' until the store is
---   reopened. A failed @fsync@ comes after the record was written and indexed,
---   so that record is visible now and may or may not survive a reopen.
---
--- * If it is interrupted by an asynchronous exception, it either happened or
---   did not; see 'withActive'.
+-- * Async exception: the write either happened or didn't; see 'withActive'.
 appendRecord :: Store -> ByteString -> Maybe ByteString -> IO ()
 appendRecord st k mv = do
   assertOpen st
@@ -711,8 +675,7 @@ appendRecord st k mv = do
             old <- atomicModifyIORef' (stKeydir st) $
               KD.replace k (if isNothing mv then Nothing else Just loc)
             forM_ old $ \o -> bumpDead st (locFileId o) (fromIntegral (locSize o))
-            -- A tombstone is never reachable from the keydir, so it is dead the
-            -- instant it is written.
+            -- Tombstones aren't in the keydir, so they're dead immediately.
             when (isNothing mv) $ bumpDead st (acFileId ac) (fromIntegral n)
             bumpTotal st (acFileId ac) (fromIntegral n)
             synced <- try (maybeSync st ac')
@@ -723,8 +686,8 @@ appendRecord st k mv = do
     needsRoll ac n =
       acOffset ac > 0 && acOffset ac + fromIntegral n > maxFileSize (stOpts st)
 
-    -- Some of the record may have reached the file. Cut it off, so that the
-    -- file ends where 'acOffset' says it does.
+    -- Part of the record may have been written. Truncate so the file ends at
+    -- 'acOffset'.
     undoWrite ac (e :: SomeException) = do
       undone <- try $ do
         injected <- fault st FaultUndo
@@ -766,12 +729,10 @@ syncStore st = do
   assertOpen st
   withMVar (stActive st) $ \case
     Nothing -> pure ()
-    -- Only the data file. The hint file is not worth an fsync of its own: until
-    -- its trailer is written at close it is ignored on open anyway, and
-    -- 'closeActive' syncs it then.
+    -- Data file only. The hint is ignored on open until its trailer is
+    -- written, and 'closeActive' syncs it then.
     Just ac -> do
-      -- A sync on a broken store cannot promise anything, so it does not
-      -- pretend to.
+      -- Syncing a broken store can't guarantee anything.
       readIORef (stBroken st) >>= mapM_ (throwIO . StoreBroken)
       synced <- try (syncData st (acData ac))
       case synced of
@@ -793,9 +754,9 @@ statsStore st = do
       , statsTotalBytes = sum (M.elems totals)
       }
 
--- | Finish the active file, stop background work and release every handle and
--- the lock. Everything is released even if finishing the active file fails;
--- that failure is thrown afterwards.
+-- | Finish the active file, stop background threads, release handles and the
+-- lock. If finishing the active file fails, everything is still released and
+-- the error is thrown at the end.
 closeStore :: Store -> IO ()
 closeStore st = do
   already <- atomicModifyIORef' (stClosed st) (\c -> (True, c))

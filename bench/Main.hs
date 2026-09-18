@@ -1,16 +1,14 @@
--- | Benchmarks, in two halves.
+-- | Benchmarks.
 --
--- /codec/ times the pure pieces every read and write goes through: the CRC, the
--- record and hint codecs, and 'encodeStrict'. /store/ times the operations a user
--- sees, against a real store in a temporary directory, so the numbers include the
--- platform layer and the OS page cache but not the disk: nothing here syncs.
+-- /codec/ covers the pure parts: CRC, record and hint codecs, 'encodeStrict'.
+-- /store/ runs the public operations against a real store in a temp directory.
+-- Nothing syncs, so it measures the page cache, not the disk.
 --
 -- > cabal bench bitcask-bench
 -- > cabal bench bitcask-bench --benchmark-options='--csv before.csv'
 -- > cabal bench bitcask-bench --benchmark-options='--baseline before.csv --fail-if-slower 10'
 --
--- The last form is the regression check: it compares against a CSV saved from an
--- earlier run and fails if anything got more than 10% slower.
+-- The last one fails if anything is more than 10% slower than the saved CSV.
 module Main (main) where
 
 import Control.Exception (evaluate)
@@ -99,7 +97,7 @@ hintFile10k = body <> encodeHintTrailer 10000 (crc32 body)
 -- ---------------------------------------------------------------------------
 -- A real store
 
--- | How many keys the populated stores hold.
+-- | Keys in the populated stores.
 population :: Int
 population = 100000
 
@@ -150,26 +148,25 @@ storeBenches =
         merge bc
   ]
 
--- | The same store at other types. The tag is a phantom, so this is free.
+-- | The same store at other types. The types are phantom, so this is free.
 retype :: Raw -> Bitcask Text Int
 retype = coerce
 
 populate :: Raw -> IO ()
 populate bc = forM_ [0 .. population - 1] $ \i -> put bc (keyOf i) (value 100)
 
--- | Fill a store and close it, optionally deleting the hint files afterwards so
--- that the next open has to scan every data file.
+-- | Fill a store and close it. Optionally delete the hint files so the next
+-- open has to scan.
 populateDir :: Bool -> FilePath -> IO ()
 populateDir dropHints dir = do
   withBitcask dir defaultOptions populate
-  -- Fold away the one-file-per-open actives, so every open reads the same files.
+  -- Merge away the per-open active files so every open reads the same files.
   void (mergeDirectory dir)
   when dropHints $ do
     names <- listDirectory dir
     forM_ [n | n <- names, ".hint" `isSuffixOf` n] $ \n -> removeFile (dir </> n)
 
--- | An open store and a counter, so that each iteration of a benchmark touches
--- a different key.
+-- | An open store and a counter so each iteration uses a different key.
 data Env = Env !FilePath !Raw !(IORef Int)
 
 counted :: IO Env -> (Raw -> Int -> IO ()) -> Benchmarkable

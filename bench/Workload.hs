@@ -1,14 +1,11 @@
--- | A fixed, end-to-end workload to profile against.
+-- | A fixed end-to-end workload for profiling.
 --
--- The benchmark suite answers \"how long does one operation take\"; this answers
--- \"where does the time and the memory go\" across a realistic run: a bulk load,
--- random reads from several threads, an overwrite-heavy phase, a merge, and a
--- reopen. Each phase prints its wall time and throughput.
+-- Bulk load, random reads from several threads, overwrites, a merge, and a
+-- reopen. Prints wall time and throughput per phase.
 --
 -- > cabal run bitcask-workload -- [keys] [value bytes] [reader threads]
 --
--- For a cost-centre profile, a heap profile, or an eventlog, see the
--- \"Profiling\" section of @README.md@.
+-- See \"Profiling\" in @README.md@ for profiling options.
 module Main (main) where
 
 import Control.Concurrent (forkIO, getNumCapabilities)
@@ -77,14 +74,13 @@ main = do
 
   removeDirectoryRecursive dir
 
--- | Open read-only, and report how much heap the open store holds on to — which
--- is, to a close approximation, the keydir.
+-- | Open read-only and report the heap the store holds, which is roughly the
+-- keydir.
 reopen :: String -> FilePath -> Int -> IO ()
 reopen name dir nKeys = do
   before <- liveBytes
   opened <- newEmptyMVar
-  -- Force the stats, which forces the keydir: an open that left it as a thunk
-  -- would look free here and be paid for by the first read.
+  -- Force the keydir, otherwise a lazy open would look free here.
   phase name nKeys $ do
     bc <- open dir defaultOptions {readOnly = True} :: IO Raw
     _ <- evaluate =<< stats bc
@@ -97,8 +93,8 @@ reopen name dir nKeys = do
     mb b = fromIntegral b / (1024 * 1024) :: Double
     perKey b = fromIntegral b / fromIntegral nKeys :: Double
 
--- | Live heap after a major GC. Zero unless the RTS is collecting statistics,
--- which the default RTS options for this program turn on.
+-- | Live heap after a major GC. Needs RTS stats, which are on by default for
+-- this program.
 liveBytes :: IO Int
 liveBytes = do
   enabled <- getRTSStatsEnabled
@@ -121,7 +117,6 @@ keyOf i = BC.pack ("key:" <> pad (show i))
   where
     pad s = replicate (10 - length s) '0' <> s
 
--- | A cheap permutation-ish spread over the key space, so reads are not in
--- write order.
+-- | Rough permutation of the key space so reads aren't in write order.
 scramble :: Int -> Int -> Int
 scramble i n = (i * 7919) `mod` n

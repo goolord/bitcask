@@ -1,6 +1,5 @@
--- | Hint files: the same records as a data file, minus the values, plus the
--- position of each record. They exist so that opening a store does not have to
--- read every value off disk to rebuild the keydir.
+-- | Hint files: a data file's records without values, plus each record's
+-- position. Lets open rebuild the keydir without reading every value.
 --
 -- > tstamp:8 | flags:1 | ksz:2 | vsz:4 | recordPos:8 | key:ksz
 --
@@ -8,10 +7,9 @@
 --
 -- > recordCount:8 | crc:4
 --
--- The trailer is what distinguishes a complete hint file from one a crash cut
--- short: without it, or with a checksum that does not match, the hint file is
--- ignored and the data file is scanned instead. Hint files are pure cache —
--- deleting every one of them costs startup time and nothing else.
+-- A hint file with a missing or bad trailer is ignored and the data file is
+-- scanned instead. Hint files are just a cache; deleting them only slows down
+-- open.
 module Database.Bitcask.Internal.Hint
   ( HintEntry (..)
   , hintEntrySize
@@ -42,7 +40,7 @@ data HintEntry = HintEntry
   , hintKey :: !ByteString
   , hintValSize :: !Word32
   , hintPos :: !Offset
-  -- ^ offset of the /record/ in the data file
+  -- ^ offset of the record in the data file
   , hintRecSize :: !Word32
   -- ^ total on-disk size of the record
   }
@@ -67,21 +65,17 @@ encodeHintEntry e = BSI.unsafeCreate (hintEntrySize + klen) $ \p -> do
   where
     klen = BS.length (hintKey e)
 
--- | The trailer, given the number of entries and the CRC accumulated over all
--- the entry bytes that precede it.
+-- | The trailer, given the entry count and the CRC over all entry bytes.
 encodeHintTrailer :: Word64 -> Word32 -> ByteString
 encodeHintTrailer n c = BSI.unsafeCreate hintTrailerSize $ \p -> do
   pokeBE64 p 0 n
   pokeBE32 p 8 c
 
--- | Every entry of a hint file, in order, or a refusal. Refusing is always safe:
--- the caller falls back to scanning the data file.
+-- | All entries of a hint file, in order, or 'Left' if it's invalid. The
+-- caller then scans the data file.
 --
--- The whole file is checked — checksum, entry framing, entry count — before
--- anything is returned, so a refused file never yields a partial result. The
--- list itself is then produced lazily, so a consumer that streams it (the keydir
--- rebuild does) never holds more than one entry at a time. Keys are slices of
--- the input; copy them if they are to outlive it.
+-- The checksum, framing and count are all checked before returning, so there
+-- are no partial results. The list is lazy. Keys are slices of the input.
 decodeHintFile :: ByteString -> Either RecordError [HintEntry]
 decodeHintFile bs
   | BS.length bs < hintTrailerSize = Left BadHintTrailer
@@ -96,8 +90,7 @@ decodeHintFile bs
 
     keySize off = fromIntegral (indexBE16 body (off + 9)) :: Int
 
-    -- Every entry lies wholly inside the body, and there are as many as the
-    -- trailer says.
+    -- All entries fit in the body and the count matches the trailer.
     framed :: Int -> Word64 -> Bool
     framed !off !n
       | off == len = n == storedCount

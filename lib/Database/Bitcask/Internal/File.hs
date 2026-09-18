@@ -1,5 +1,4 @@
--- | Data files: what they are called, how a store directory is laid out, and how
--- a file is scanned back into keydir refs.
+-- | Data file naming, directory layout, and scanning files into keydir refs.
 module Database.Bitcask.Internal.File
   ( -- * Paths
     dataPath
@@ -53,9 +52,8 @@ import Database.Bitcask.Internal.Record
   )
 import Database.Bitcask.Types
 
--- | Data files are named @\<base\>-\<sub\>.data@ with both halves zero-padded to
--- ten digits, so that sorting the names lexicographically sorts the ids
--- numerically.
+-- | Data files are named @\<base\>-\<sub\>.data@, zero-padded to ten digits so
+-- names sort in id order.
 dataPath :: FilePath -> FileId -> FilePath
 dataPath dir fid = dir </> fileStem fid <> ".data"
 
@@ -89,17 +87,15 @@ parseDataName name = do
 listDataFiles :: FilePath -> IO [FileId]
 listDataFiles dir = sort . mapMaybe parseDataName <$> listDirectory dir
 
--- | How much of a file to pull into memory at a time while scanning.
+-- | Scan read size.
 chunkSize :: Int
 chunkSize = 1024 * 1024
 
 -- | Fold a data file into keydir refs, in write order.
 --
--- Returns the accumulator and, if the file ends in a torn write, the offset the
--- file should be truncated to. A record that fails to decode in the /middle/ of a
--- file is real corruption and throws 'CorruptRecord'; only a failure that reaches
--- exactly the end of the file can be a torn tail, because that is the only place
--- a killed process could have left one.
+-- Returns the accumulator and, if the file ends in a torn write, the offset to
+-- truncate to. A bad record in the middle of a file throws 'CorruptRecord'.
+-- Only a bad record that runs to the end of the file counts as a torn tail.
 foldDataFile
   :: Bool
   -- ^ verify checksums
@@ -134,12 +130,12 @@ foldDataFile verify path fid rh size step = go 0 BS.empty
                       acc' = step acc ref
                    in acc' `seq` go (off + fromIntegral n) (BS.drop n buf) acc'
 
-    -- Pull another chunk in behind whatever is already buffered.
+    -- Read the next chunk onto the end of the buffer.
     refill off buf acc = do
       let have = off + fromIntegral (BS.length buf)
       if have >= size
         then
-          -- Nothing left to read and the buffer does not hold a whole record.
+          -- EOF and no whole record left in the buffer.
           pure (acc, if BS.null buf then Nothing else Just off)
         else do
           more <- preadAt rh have chunkSize
@@ -147,9 +143,8 @@ foldDataFile verify path fid rh size step = go 0 BS.empty
             then pure (acc, if BS.null buf then Nothing else Just off)
             else go off (buf <> more) acc
 
-    -- A decode failure is a torn tail only if the record it describes would run
-    -- to the end of the file; anywhere else it is corruption, and skipping it
-    -- would silently resurrect an older value for that key.
+    -- Only a torn tail if the record would run to EOF. Anywhere else it's
+    -- corruption, and skipping it would bring back an older value.
     tornOrCorrupt off err acc mh =
       let reachesEnd = case mh of
             Nothing -> False
@@ -170,11 +165,10 @@ refFromHint fid e =
     , refTombstone = hintTombstone e
     }
 
--- | The refs of a hint file, in write order, if there is a complete hint file.
--- 'Nothing' means \"scan the data file instead\", which is always a safe answer.
+-- | The refs from a complete hint file, in write order. 'Nothing' means scan
+-- the data file instead.
 --
--- The file is fully validated before this returns; the list is then produced
--- lazily as it is consumed.
+-- The file is validated up front; the list is lazy.
 readHintRefs :: FilePath -> FileId -> IO (Maybe [Ref])
 readHintRefs dir fid = do
   let p = hintPath dir fid
@@ -189,14 +183,14 @@ readHintRefs dir fid = do
           Left _ -> Nothing
           Right es -> Just (map (refFromHint fid) es)
 
--- | Bumped whenever the on-disk format changes incompatibly.
+-- | Bump on incompatible format changes.
 formatVersion :: Word32
 formatVersion = 1
 
 metaMagic :: ByteString
 metaMagic = BC.pack "BITCASK\0"
 
--- | Read @bitcask.meta@. 'Nothing' means the directory has no store in it yet.
+-- | Read @bitcask.meta@. 'Nothing' for a new store.
 readMeta :: FilePath -> IO (Maybe (Word32, Maybe Text))
 readMeta dir = do
   let p = metaPath dir
@@ -228,9 +222,8 @@ writeMeta dir tag =
   where
     tagBytes = maybe BS.empty (TE.encodeUtf8) tag
 
--- | File ids that merge wanted to delete but could not, because a reader still
--- held the file open. Only Windows ever produces these; they are swept at the
--- next 'Database.Bitcask.open', when nothing else has the store.
+-- | File ids merge couldn't delete because a reader had them open. Windows
+-- only. Deleted on the next 'Database.Bitcask.open'.
 readPending :: FilePath -> IO [FileId]
 readPending dir = do
   let p = pendingPath dir

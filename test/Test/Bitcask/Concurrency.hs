@@ -14,11 +14,9 @@ import Database.Bitcask.Raw (Raw)
 
 -- | Readers, a writer and a merge all at once.
 --
--- Every value is tagged with the key that owns it, so a read that returned the
--- wrong record — a stale location after a merge moved it, a torn read — shows up
--- as a value belonging to a different key rather than as a silent pass. This is
--- the test that would catch a broken positional read on a platform where
--- concurrent reads share a file pointer.
+-- Each value is tagged with its key, so reading the wrong record (a stale
+-- location after merge, a torn read) shows up as a mismatch. This also catches
+-- positional reads that share a file pointer.
 tests :: TestTree
 tests =
   testGroup
@@ -39,7 +37,7 @@ tests =
             forkFinally' (done !! readers) errs $ writerLoop bc
             forkFinally' (done !! (readers + 1)) errs $ mergeLoop bc stop merges
 
-            -- The writer finishes first, then everyone else winds down.
+            -- Wait for the writer, then stop the rest.
             takeMVar (done !! readers)
             writeIORef stop True
             forM_ [0 .. readers - 1] $ \i -> takeMVar (done !! i)
@@ -48,7 +46,7 @@ tests =
             problems <- readIORef errs
             unless (null problems) $ assertFailure (unlines (take 5 problems))
 
-            -- A test that raced nothing proves nothing, so make it say so.
+            -- Fail if nothing actually overlapped.
             nReads <- readIORef reads'
             nMerges <- readIORef merges
             assertBool "readers did no work" (nReads > 100)
@@ -95,7 +93,7 @@ tests =
             threadDelay 1000
             go
 
--- | Fork an action, record anything it throws, and signal completion either way.
+-- | Fork an action, record what it throws, and signal when done.
 forkFinally' :: MVar () -> IORef [String] -> IO () -> IO ()
 forkFinally' done errs act = void . forkIO $ do
   r <- try act

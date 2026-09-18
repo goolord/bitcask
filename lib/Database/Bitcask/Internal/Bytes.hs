@@ -1,10 +1,8 @@
 -- | Big-endian integers in and out of raw memory, for the record and hint codecs.
 --
--- The codecs used to go through a 'Data.ByteString.Builder' and then copy the
--- result into a strict 'ByteString', which for a record of a hundred bytes cost
--- more than the write system call it was preparing. Every encoded thing in the
--- file format has its size known up front, so the codecs now allocate exactly
--- once and poke fields straight into the buffer with these.
+-- Going through a 'Data.ByteString.Builder' cost more than the write syscall
+-- for a 100-byte record. Sizes are always known up front, so the codecs
+-- allocate once and poke fields directly.
 module Database.Bitcask.Internal.Bytes
   ( pokeBE16
   , pokeBE32
@@ -26,9 +24,8 @@ import GHC.ByteOrder (ByteOrder (..), targetByteOrder)
 import GHC.Word (byteSwap16, byteSwap32, byteSwap64)
 import System.IO.Unsafe (unsafeDupablePerformIO)
 
--- Unaligned loads and stores are fine on every platform GHC targets that we care
--- about (x86-64 and AArch64), and GHC compiles 'peek' at these types to a single
--- load.
+-- Unaligned access is fine on x86-64 and AArch64, and 'peek' at these types
+-- compiles to a single load.
 
 be16 :: Word16 -> Word16
 be16 = if targetByteOrder == LittleEndian then byteSwap16 else id

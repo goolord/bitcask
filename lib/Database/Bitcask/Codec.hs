@@ -1,9 +1,7 @@
--- | How a Haskell value becomes the bytes that go on disk.
+-- | Encoding keys and values to bytes.
 --
--- The store is parameterised over its key and value types
--- (@'Database.Bitcask.Bitcask' k v@) and everything below this module works in
--- terms of encoded bytes, so this is purely a boundary: one encode on write, one
--- decode on read, and nothing else changes.
+-- Everything below @'Database.Bitcask.Bitcask' k v@ works on bytes. This is
+-- one encode on write and one decode on read.
 module Database.Bitcask.Codec
   ( Codec (..)
   , encodeStrict
@@ -28,41 +26,33 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
 import GHC.Float (castWord64ToDouble)
 
--- | Encoding and decoding for something a Bitcask store can hold.
+-- | Encoding and decoding for keys and values.
 --
--- The law is a plain roundtrip:
+-- Law:
 --
 -- prop> fromBytes (encodeStrict x) == Right x
 --
--- It is worth saying why that single law is enough for keys. A law of that shape
--- forces 'toBytes' to be /injective/: if two distinct values encoded to the same
--- bytes, 'fromBytes' could not return both. Injectivity is exactly what a key
--- needs — two keys that encoded alike would silently become one key, and nothing
--- would ever report it. So the law is the correctness condition for the key side
--- rather than decoration, and every instance here is property-tested against it.
+-- This makes 'toBytes' injective, which is what keys need: two keys that
+-- encoded the same would silently become one. Every instance here is
+-- property-tested against it.
 --
--- Two further obligations that the type cannot express, and that the haddocks for
--- your own instances should repeat:
+-- Key encodings also need to be:
 --
--- * A key encoding must be /deterministic/. Anything whose byte layout depends
---   on iteration order — a @HashMap@, a @Set@ built in a different order — is
---   not a lawful key.
+-- * /Deterministic./ Anything whose bytes depend on iteration order (a
+--   @HashMap@, say) is not a valid key.
 --
--- * A key encoding must be /stable across releases of your program/. Change it
---   and every key already on disk is orphaned, with no error to tell you.
+-- * /Stable across versions of your program./ If the encoding changes, every
+--   existing key is orphaned with no error.
 class Codec a where
   toBytes :: a -> Builder
   fromBytes :: ByteString -> Either String a
 
--- | Run 'toBytes' and get the strict bytes that would be written.
+-- | Run 'toBytes' and get strict bytes.
 --
--- Every 'Database.Bitcask.put' runs this twice, so the allocation strategy is
--- tuned for what keys and values usually are: small. The default strategy starts
--- with a four-kilobyte buffer and then copies the result out of it if it came
--- out much smaller, which for a 16-byte key is two allocations and a copy to
--- produce 16 bytes. This starts with a buffer just big enough for a typical
--- small key or value, and does not trim: when the whole encoding fits the
--- first buffer, the result is a slice of it and there is no copy at all.
+-- Every 'Database.Bitcask.put' calls this twice, so it's tuned for small
+-- inputs. The default strategy starts with a 4 KiB buffer and trims, which is
+-- two allocations and a copy for a 16-byte key. This starts with a small
+-- buffer and doesn't trim, so if the encoding fits it's just a slice.
 encodeStrict :: (Codec a) => a -> ByteString
 encodeStrict =
   BL.toStrict
@@ -72,16 +62,14 @@ encodeStrict =
 
 -- $deriving
 --
--- Rather than inventing another serialisation format, adapt one you already
--- have. 'AsSerialize' covers @cereal@:
+-- Use a serialisation library you already have. 'AsSerialize' covers @cereal@:
 --
 -- > data User = User { userName :: String, userAge :: Int }
 -- >   deriving stock (Show, Generic)
 -- >   deriving anyclass (Serialize)
 -- >   deriving Codec via (AsSerialize User)
 --
--- Adapters for @binary@, @store@ or @serialise@ are a few lines each and belong
--- in your project rather than behind a cabal flag on this one:
+-- Adapters for @binary@, @store@ or @serialise@ are a few lines each:
 --
 -- > newtype AsBinary a = AsBinary a
 -- > instance Binary a => Codec (AsBinary a) where
@@ -90,22 +78,20 @@ encodeStrict =
 -- >     Right (rest, _, a) | BL.null rest -> Right (AsBinary a)
 -- >     _ -> Left "AsBinary: decode failed"
 
--- | Derive a 'Codec' from a @cereal@ 'Cereal.Serialize' instance, via
--- @DerivingVia@.
+-- | 'Codec' from a @cereal@ 'Cereal.Serialize' instance, for @DerivingVia@.
 newtype AsSerialize a = AsSerialize {unAsSerialize :: a}
 
 instance (Cereal.Serialize a) => Codec (AsSerialize a) where
   toBytes (AsSerialize a) = BB.byteString (Cereal.encode a)
-  -- Not 'Cereal.decode': it ignores whatever follows a complete value.
+  -- Not 'Cereal.decode', which ignores trailing bytes.
   fromBytes = fmap AsSerialize . Cereal.runGet (Cereal.get <* end)
     where
       end = do
         done <- Cereal.isEmpty
         unless done $ fail "AsSerialize: trailing bytes after a complete value"
 
--- Every instance below rejects trailing bytes. A decoder that ignores them would
--- break the roundtrip law in the other direction and, for keys, would make two
--- different byte strings decode to the same value.
+-- All instances below reject trailing bytes. Otherwise two different byte
+-- strings could decode to the same key.
 
 instance Codec ByteString where
   toBytes = BB.byteString
@@ -163,14 +149,13 @@ instance Codec Int64 where
   toBytes = BB.int64BE
   fromBytes = fixed 8 (fromIntegral @Word64 . be) "Codec Int64"
 
--- | Encoded as a big-endian 'Int64', so a store written on a 64-bit machine
--- reads on a 32-bit one.
+-- | Big-endian 'Int64', so the encoding doesn't depend on word size.
 instance Codec Int where
   toBytes = BB.int64BE . fromIntegral
   fromBytes = fmap (fromIntegral @Int64) . fromBytes
 
--- | Encoded as IEEE-754 big-endian. Beware as a /key/: distinct @NaN@ payloads
--- are distinct keys, and @0@ and @-0@ are two keys that compare equal.
+-- | IEEE-754 big-endian. Careful using these as keys: different @NaN@ payloads
+-- are different keys, and @0@ and @-0@ are two keys that compare equal.
 instance Codec Double where
   toBytes = BB.doubleBE
   fromBytes = fmap castWord64ToDouble . fromBytes

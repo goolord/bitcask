@@ -46,8 +46,7 @@ tests =
         forAll smallBytes $ \k ->
           forAll smallBytes $ \v ->
             BS.length (encodeRecord 0 k (Just v)) === headerSize + BS.length k + BS.length v
-    , -- Flipping any single bit anywhere in a record has to be caught. This is
-      -- the property the whole on-disk format exists to support.
+    , -- Any single bit flip in a record must be caught.
       testProperty "any single-bit flip is detected" $
         forAll smallBytes $ \k ->
           forAll smallBytes $ \v ->
@@ -109,13 +108,11 @@ hintEntry = do
       , hintRecSize = fromIntegral (headerSize + BS.length k) + vsz
       }
 
--- | Byte strings long enough to exercise the eight-bytes-at-a-time loop and
--- every length of tail after it.
+-- | Long enough to hit the 8-byte loop and every tail length.
 longerBytes :: Gen ByteString
 longerBytes = BS.pack <$> (choose (0, 200) >>= \n -> vectorOf n arbitrary)
 
--- | CRC-32 straight from the definition, one bit at a time: slow, and too
--- simple to get wrong, which is what makes it a reference.
+-- | Bit-at-a-time CRC-32 as a reference.
 referenceCrc :: ByteString -> Word32
 referenceCrc = complement . BS.foldl' byte 0xFFFFFFFF
   where

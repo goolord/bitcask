@@ -23,9 +23,7 @@ withStoreOpts opts act =
   withSystemTempDirectory "bitcask-test" $ \dir ->
     withBitcask dir opts (act dir)
 
--- | Keys are drawn from a small space on purpose, so that generated programs
--- actually overwrite and delete the same key rather than only ever appending
--- fresh ones.
+-- | Small key space so generated programs overwrite and delete existing keys.
 newtype Key = Key {unKey :: ByteString}
   deriving stock (Eq, Ord, Show)
 
@@ -38,7 +36,7 @@ newtype Val = Val {unVal :: ByteString}
 instance Arbitrary Val where
   arbitrary = Val <$> smallBytes
 
--- | Short byte strings, including the empty one — storing an empty value is
--- legal here and is the case the paper's sentinel tombstone would have broken.
+-- | Short byte strings, including empty. Empty values are allowed here (the
+-- paper's tombstone value would break this).
 smallBytes :: Gen ByteString
 smallBytes = BS.pack <$> (choose (0, 24) >>= \n -> vectorOf n arbitrary)

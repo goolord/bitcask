@@ -16,13 +16,12 @@ import Database.Bitcask
 import Database.Bitcask.Internal.Record (headerSize)
 import Database.Bitcask.Raw (Raw)
 
--- | A process killed mid-append leaves a partial record at the end of the active
--- file. This truncates a real store at /every/ byte offset and requires that
--- reopening it recovers exactly the records that fit entirely in the surviving
--- prefix — not merely that it does not crash.
+-- | A process killed mid-append leaves a partial record at the end of the
+-- active file. Truncate a real store at every byte offset and check that
+-- reopening recovers exactly the records that fit in the prefix.
 --
--- The hint file is removed alongside, because a crash would have left it without
--- the trailer that makes it usable.
+-- The hint file is removed too, since a crash would have left it without a
+-- trailer.
 tests :: TestTree
 tests =
   testGroup
@@ -51,8 +50,7 @@ tests =
                     <> show (M.toList want)
     ]
 
--- | A short program with overwrites and a deletion, so the prefix model is not
--- trivial.
+-- | A short program with overwrites and a delete.
 writes :: [(ByteString, Maybe ByteString)]
 writes =
   [ ("a", Just "1")
@@ -66,8 +64,7 @@ writes =
   , ("a", Just "6")
   ]
 
--- | What the store must hold once the data file is cut to @n@ bytes: exactly the
--- writes whose records fit whole.
+-- | Expected contents after truncating to @n@ bytes: the writes that fit whole.
 modelAt :: Int -> M.Map ByteString ByteString
 modelAt n = snd (foldl step (0 :: Int, M.empty) writes)
   where

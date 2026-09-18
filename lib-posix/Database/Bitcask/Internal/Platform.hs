@@ -2,16 +2,12 @@
 
 -- | POSIX implementation of the platform layer.
 --
--- There is a matching module under @lib-windows@ with the same interface; cabal
--- picks one by @os(windows)@, which is why this module is @other-modules@ and
--- why nothing outside the library may import it. See @DESIGN.md@ §2.
+-- @lib-windows@ has the same interface; cabal picks one with @os(windows)@.
+-- That's why this is in @other-modules@. See @DESIGN.md@ §2.
 --
--- Positional reads go straight to @pread(2)@ through the FFI rather than through
--- @unix@'s @fdPread@, because that function only appeared in @unix-2.8@ and
--- binding the syscall directly costs four lines and works on every GHC we care
--- about. @pread@ takes no lock and moves no file pointer, so any number of
--- threads may read one descriptor at once — which is what makes
--- 'Database.Bitcask.get' lock-free.
+-- Reads call @pread(2)@ through the FFI instead of @unix@'s @fdPread@, which
+-- needs @unix-2.8@. @pread@ takes no lock and doesn't move the file pointer, so
+-- threads can share a descriptor, and 'Database.Bitcask.get' can be lock-free.
 module Database.Bitcask.Internal.Platform
   ( platformName
   , ReadHandle
@@ -80,7 +76,7 @@ newtype ReadHandle = ReadHandle Fd
 openRead :: FilePath -> IO ReadHandle
 openRead p = ReadHandle <$> (handleToFd =<< openBinaryFile p ReadMode)
 
--- | Read @n@ bytes at an absolute offset. Returns fewer bytes at end of file.
+-- | Read @n@ bytes at an offset. Returns fewer at end of file.
 preadAt :: ReadHandle -> Word64 -> Int -> IO ByteString
 preadAt (ReadHandle (Fd fd)) off n
   | n <= 0 = pure BS.empty
@@ -125,29 +121,27 @@ appendBytes (AppendHandle fd) bs =
       n <- fdWriteBuf fd p (fromIntegral len)
       go (p `plusPtr` fromIntegral n) (len - fromIntegral n)
 
--- | @fsync@ the file. Note that flushing a buffer is not this.
+-- | @fsync@ the file.
 syncFile :: AppendHandle -> IO ()
 syncFile (AppendHandle fd) = fileSynchronise fd
 
 closeAppend :: AppendHandle -> IO ()
 closeAppend (AppendHandle fd) = closeFd fd
 
--- | Cut the file back to @n@ bytes and put the write position there, undoing an
--- append that failed part-way. Both halves matter: appends go to the
--- descriptor's file position, which a partial write has already moved, so
--- truncating alone would leave the next append writing past a hole.
+-- | Truncate to @n@ bytes and seek there, to undo a partial append. The seek
+-- matters: appends go to the file position, which the partial write moved, so
+-- without it the next append would leave a hole.
 truncateAppend :: AppendHandle -> Word64 -> IO ()
 truncateAppend (AppendHandle fd) n = do
   setFdSize fd (fromIntegral n)
   _ <- fdSeek fd AbsoluteSeek (fromIntegral n)
   pure ()
 
--- | @fsync@ the directory, which is what makes a newly /created/ file durable.
--- There is no equivalent on Windows and none is needed there.
+-- | @fsync@ the directory so newly created files are durable. Not needed on
+-- Windows.
 syncDir :: FilePath -> IO ()
 syncDir dir = withCString dir $ \cs -> do
-  -- O_RDONLY is 0 on every POSIX system; binding the constant properly would
-  -- mean pulling in hsc2hs for one number.
+  -- O_RDONLY is 0 everywhere. Not worth hsc2hs for one constant.
   fd <- throwErrnoIfMinus1 "bitcask: open directory" (c_open cs 0)
   throwErrnoIfMinus1_ "bitcask: fsync directory" (c_fsync fd)
     `finally` c_close fd
@@ -162,9 +156,9 @@ newtype LockHandle = LockHandle Fd
 
 -- | Take the store lock, or report who holds it.
 --
--- This is an advisory @fcntl@ lock rather than an @O_EXCL@ create, because the
--- kernel drops an advisory lock when the process dies: a writer that crashes
--- does not leave a store that needs manual unwedging.
+-- Uses an advisory @fcntl@ lock instead of an @O_EXCL@ create, since the kernel
+-- drops it when the process dies and a crashed writer doesn't leave a stale
+-- lock behind.
 takeLock :: FilePath -> LockMode -> IO (Either (Maybe Word32) LockHandle)
 takeLock p mode = do
   opened <- try (handleToFd =<< openBinaryFile p ReadWriteMode)
@@ -189,8 +183,8 @@ takeLock p mode = do
 dropLock :: LockHandle -> IO ()
 dropLock (LockHandle fd) = closeFd fd
 
--- | Remove a file that readers may still have open. On POSIX this always works:
--- the inode survives until the last descriptor closes.
+-- | Remove a file that readers may still have open. Always works on POSIX; the
+-- inode lives until the last descriptor closes.
 removeOpen :: FilePath -> IO Bool
 removeOpen p = do
   r <- try (removeFile p)

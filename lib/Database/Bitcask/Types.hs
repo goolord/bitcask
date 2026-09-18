@@ -1,5 +1,4 @@
--- | Types shared across the whole library: file identity, keydir entries,
--- options and errors.
+-- | Shared types: file ids, keydir entries, options and errors.
 module Database.Bitcask.Types
   ( -- * Files and locations
     FileId
@@ -35,17 +34,16 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Text (Text)
 import Data.Word (Word32, Word64, Word8)
 
--- | Identifies one data file within a store.
+-- | A data file's id within a store.
 --
--- A 'FileId' is a pair of 32-bit counters packed into a 'Word64': the high half
--- is the /base/, bumped every time the active file rolls, and the low half is a
--- /sub/ sequence used only by merge.
+-- Two 32-bit counters packed into a 'Word64'. The high half is the /base/,
+-- bumped each time the active file rolls. The low half is the /sub/, only used
+-- by merge.
 --
--- The point of the pair is that @('FileId', offset)@ is a total order on writes
--- that does not depend on the system clock, /and/ that merge can allocate ids
--- which sort strictly before the current active file. Merge output is older than
--- anything written while the merge was running, so it must replay first; with a
--- single flat counter there is no id to give it. See @DESIGN.md@ §3.1.
+-- @('FileId', offset)@ orders writes without relying on the clock, and merge
+-- can pick ids that sort before the active file. Merge output is older than
+-- anything written during the merge, so it has to replay first, and a flat
+-- counter has no id for it. See @DESIGN.md@ §3.1.
 newtype FileId = FileId {unFileId :: Word64}
   deriving stock (Eq, Ord)
 
@@ -64,12 +62,11 @@ fileSub (FileId w) = fromIntegral (w .&. 0xFFFFFFFF)
 -- | A byte offset within a data file.
 type Offset = Word64
 
--- | Where the live record for a key lives. This is the value side of the keydir,
--- and there is one of these in memory for every key in the store.
+-- | Where a key's live record is. One per key in the keydir.
 --
--- 'locPos' is the offset of the /record/, not of the value: reading the whole
--- record costs @19 + keySize@ extra bytes and lets 'Database.Bitcask.get' verify
--- the checksum before handing anything back.
+-- 'locPos' is the offset of the record, not the value. Reading the whole
+-- record is @19 + keySize@ extra bytes and lets 'Database.Bitcask.get' check
+-- the CRC.
 data Loc = Loc
   { locFileId :: {-# UNPACK #-} !FileId
   , locPos :: {-# UNPACK #-} !Offset
@@ -79,11 +76,10 @@ data Loc = Loc
   }
   deriving stock (Eq, Show)
 
--- | When to push writes through to the disk.
+-- | When to @fsync@.
 --
--- The default is 'SyncNever', which matches the paper (its @o_sync@ is off by
--- default) and is the honest one: Bitcask's durability story is \"call
--- 'Database.Bitcask.sync', or accept losing the tail\".
+-- Defaults to 'SyncNever', like the paper (@o_sync@ is off by default). Call
+-- 'Database.Bitcask.sync' or accept losing the tail on a crash.
 data SyncPolicy
   = SyncNever
   | SyncOnPut
@@ -116,8 +112,8 @@ data OpenOptions = OpenOptions
   -- ^ truncate a torn record at the end of the active file instead of failing
   , mergePolicy :: !MergePolicy
   , storeTag :: !(Maybe Text)
-  -- ^ if set, recorded in @bitcask.meta@ and checked on every open; use it to
-  -- catch opening a store with the wrong key\/value types
+  -- ^ stored in @bitcask.meta@ and checked on open; catches opening a store
+  -- at the wrong key\/value types
   }
   deriving stock (Eq, Show)
 
@@ -170,8 +166,8 @@ data BitcaskError
   = -- | another process holds the lock, and its pid if we can tell
     LockHeld !FilePath !(Maybe Word32)
   | CorruptRecord !FilePath !Offset !RecordError
-  | -- | the CRC was fine but the bytes would not decode, which almost always
-    -- means the store was opened at the wrong key\/value types
+  | -- | CRC passed but the bytes didn't decode; usually means the store was
+    -- opened at the wrong key\/value types
     DecodeFailure !Field !String
   | -- | expected, found
     SchemaMismatch !FilePath !Text !Text
@@ -181,19 +177,17 @@ data BitcaskError
   | NotAStore !FilePath
   | WriteToReadOnly
   | UseAfterClose
-  | -- | A write failed in a way that leaves the end of the active data file in
-    -- an unknown state: an @fsync@ failed, or a failed append could not be
-    -- undone. Every later write fails with this rather than risk recording
-    -- data at the wrong place. Reads still work. Close and reopen the store to
-    -- recover; reopening repairs the file. The message says what failed.
+  | -- | An @fsync@ failed, or a failed append couldn't be undone, so the end of
+    -- the active file is unknown. All later writes fail with this. Reads still
+    -- work. Close and reopen to recover. The message says what failed.
     StoreBroken !String
   deriving stock (Show)
   deriving anyclass (Exception)
 
--- | Encoded keys may not exceed 64 KiB, because @ksz@ is a 'Word16'.
+-- | Max encoded key size, 64 KiB (@ksz@ is a 'Word16').
 maxKeySize :: Int
 maxKeySize = 0xFFFF
 
--- | Encoded values may not exceed 4 GiB, because @vsz@ is a 'Word32'.
+-- | Max encoded value size, 4 GiB (@vsz@ is a 'Word32').
 maxValueSize :: Int
 maxValueSize = 0xFFFFFFFF

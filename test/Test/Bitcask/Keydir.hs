@@ -1,5 +1,5 @@
--- Orphan Arbitrary instances for the library's own types. Test-only, and the
--- alternative — newtype wrappers around every type under test — buys nothing.
+-- Orphan Arbitrary instances. Test-only, and newtype wrappers wouldn't buy
+-- anything.
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Test.Bitcask.Keydir (tests) where
@@ -16,9 +16,7 @@ import Database.Bitcask.Types
 
 import Test.Bitcask.Util (Key (..))
 
--- | The keydir is a pure fold over refs in write order, so it can be checked
--- against the obvious model — a 'Data.Map' with the same fold applied — without
--- touching a filesystem.
+-- | The keydir is a pure fold, so check it against a 'Data.Map' model.
 tests :: TestTree
 tests =
   testGroup

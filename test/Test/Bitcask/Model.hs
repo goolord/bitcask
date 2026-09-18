@@ -88,12 +88,11 @@ tests =
               Right _ -> assertFailure "expected LockHeld"
     ]
 
--- | Run a generated program against a real store and against a 'Data.Map', and
--- require them to agree after every single step.
+-- | Run a generated program against a real store and a 'Data.Map' and check
+-- they agree after every step.
 --
--- @OpReopen@ is what makes this a recovery test as well: the store is closed and
--- reopened mid-program, so every reopen has to rebuild a keydir that still
--- matches the model.
+-- @OpReopen@ closes and reopens the store mid-program, so this tests recovery
+-- too.
 prop_model :: [Op] -> Property
 prop_model ops = ioProperty $
   withSystemTempDirectory "bitcask-model" $ \dir -> do
@@ -107,8 +106,7 @@ prop_model ops = ioProperty $
         Just err -> counterexample err False
         Nothing -> property True
   where
-    -- Small files so that a short program still rolls the active file and gives
-    -- merge something to do.
+    -- Small files so short programs still roll and merge has work to do.
     smallFiles = defaultOptions {maxFileSize = 256}
 
     step _ acc@(_, _, Just _) _ = pure acc

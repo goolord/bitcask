@@ -30,9 +30,8 @@ tests =
         , testProperty "()" $ law ()
         , testProperty "AsSerialize" $ \n s -> lawVia (User s n)
         ]
-    , -- The roundtrip law is what forces 'toBytes' to be injective, which is the
-      -- property keys actually need: two keys that encoded alike would silently
-      -- become one key. Checking it directly on a small domain is cheap.
+    , -- Keys need 'toBytes' to be injective. Cheap to check directly on a small
+      -- domain.
       testProperty "key encodings are injective (ByteString)" $
         forAll smallBytes $ \a ->
           forAll smallBytes $ \b ->
