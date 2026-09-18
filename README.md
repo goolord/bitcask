@@ -129,4 +129,3 @@ capabilities the parallel GC can cost more than it saves; try `+RTS -qg` or
 `-qn4`.
 
 [paper]: https://riak.com/assets/bitcask-intro.pdf
-# bitcask
