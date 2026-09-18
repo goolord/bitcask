@@ -10,8 +10,7 @@ description:
     A read is one hash lookup and one positional read, a write is one append.
     Every key is kept in RAM.
     .
-    Start with "Database.Bitcask". @DESIGN.md@ covers the format and
-    concurrency model.
+    Start with "Database.Bitcask".
 
 license:            MIT
 license-file:       LICENSE
@@ -21,7 +20,6 @@ category:           Database
 build-type:         Simple
 extra-doc-files:
     CHANGELOG.md
-    DESIGN.md
     README.md
 
 tested-with:        GHC ==9.4.7

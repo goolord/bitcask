@@ -8,7 +8,7 @@
   deletion, and a merge that runs concurrently with reads and writes.
 * Torn-write repair on open; other corruption throws.
 * POSIX and Windows platform layers. The Windows layer hasn't been compiled
-  yet (see `DESIGN.md`, revision 3, point 7).
+  yet.
 * Performance, measured with the new `bitcask-bench` and `bitcask-workload`:
   * Record and hint codecs poke fields into one exact-size buffer instead of
     using a `Builder`. CRC-32 uses slicing-by-8.

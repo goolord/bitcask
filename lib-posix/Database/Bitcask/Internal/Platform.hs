@@ -3,7 +3,7 @@
 -- | POSIX implementation of the platform layer.
 --
 -- @lib-windows@ has the same interface; cabal picks one with @os(windows)@.
--- That's why this is in @other-modules@. See @DESIGN.md@ §2.
+-- That's why this is in @other-modules@.
 --
 -- Reads call @pread(2)@ through the FFI instead of @unix@'s @fdPread@, which
 -- needs @unix-2.8@. @pread@ takes no lock and doesn't move the file pointer, so

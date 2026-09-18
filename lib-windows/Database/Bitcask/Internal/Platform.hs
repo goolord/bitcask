@@ -1,7 +1,6 @@
 -- | Windows implementation of the platform layer.
 --
--- Same interface as @lib-posix@; cabal picks one with @os(windows)@. See
--- @DESIGN.md@ §2.
+-- Same interface as @lib-posix@; cabal picks one with @os(windows)@.
 --
 -- Differences from POSIX:
 --

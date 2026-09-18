@@ -11,7 +11,7 @@
 -- it has to be replayed first on open. That's why file ids are @(base, sub)@:
 -- merge uses @(base of newest input, next sub)@, which sorts after all inputs
 -- and before the active file. With a flat counter there'd be no id that works,
--- and a restart would bring back stale values. See @DESIGN.md@ §3.1.
+-- and a restart would bring back stale values.
 --
 -- Every immutable file is merged at once. That makes dropping tombstones safe,
 -- since no older file can still have a value for the key. Partial merges would

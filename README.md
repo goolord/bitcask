@@ -128,10 +128,5 @@ mostly measures the OS. The workload runs with `-N`, and with many idle
 capabilities the parallel GC can cost more than it saves; try `+RTS -qg` or
 `-qn4`.
 
-## Design
-
-[`DESIGN.md`](DESIGN.md) explains the format, error handling and concurrency
-model, and where the implementation diverged from the original design.
-
 [paper]: https://riak.com/assets/bitcask-intro.pdf
 # bitcask

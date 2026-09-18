@@ -43,7 +43,7 @@ import Data.Word (Word32, Word64, Word8)
 -- @('FileId', offset)@ orders writes without relying on the clock, and merge
 -- can pick ids that sort before the active file. Merge output is older than
 -- anything written during the merge, so it has to replay first, and a flat
--- counter has no id for it. See @DESIGN.md@ §3.1.
+-- counter has no id for it.
 newtype FileId = FileId {unFileId :: Word64}
   deriving stock (Eq, Ord)
 
