@@ -103,9 +103,9 @@ module Database.Bitcask
   , maxValueSize
   ) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIOWithUnmask, threadDelay)
 import Control.Exception (SomeException, bracket, throwIO, try)
-import Control.Monad (forever, void, when)
+import Control.Monad (forever, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef')
 
@@ -210,7 +210,7 @@ stats (Bitcask st) = statsStore st
 -- | Start background threads for merge and sync policies.
 startBackground :: Store -> IO ()
 startBackground st = do
-  when (not (readOnly (stOpts st))) $ case mergePolicy (stOpts st) of
+  unless (readOnly (stOpts st)) $ case mergePolicy (stOpts st) of
     MergeAuto _ micros | micros > 0 -> spawn $ forever $ do
       threadDelay micros
       due <- shouldMerge st
@@ -222,8 +222,10 @@ startBackground st = do
       ignoring (syncStore st)
     _ -> pure ()
   where
+    -- Unmasked, so 'close' can kill a running merge. 'withBitcask' calls
+    -- 'open' inside 'bracket', which masks, and threads inherit that.
     spawn act = do
-      tid <- forkIO act
+      tid <- forkIOWithUnmask (\unmask -> unmask act)
       atomicModifyIORef' (stThreads st) (\ts -> (tid : ts, ()))
     -- Don't let the worker die. Real errors will show up on the next
     -- foreground call anyway.

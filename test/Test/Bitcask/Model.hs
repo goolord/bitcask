@@ -86,6 +86,26 @@ tests =
               Left (LockHeld _ _) -> pure ()
               Left e -> assertFailure ("wrong error: " <> show e)
               Right _ -> assertFailure "expected LockHeld"
+    , testCase "read-only handles share the lock and keep writers out" $
+        withSystemTempDirectory "bitcask-shared" $ \dir -> do
+          let ro = defaultOptions {readOnly = True}
+              refused what act = do
+                r <- try act
+                case r of
+                  Left (LockHeld _ _) -> pure ()
+                  Left e -> assertFailure (what <> ": wrong error: " <> show e)
+                  Right bc -> close (bc :: Raw) >> assertFailure (what <> ": expected LockHeld")
+          withBitcask dir defaultOptions $ \(bc :: Raw) -> do
+            put bc "a" "1"
+            refused "read-only open alongside a writer" (open dir ro)
+          r1 <- open dir ro :: IO Raw
+          r2 <- open dir ro :: IO Raw
+          close r1
+          -- Closing one reader mustn't drop the lock the other relies on.
+          refused "writer alongside a reader" (open dir defaultOptions)
+          get r2 "a" >>= (@?= Just "1")
+          close r2
+          withBitcask dir defaultOptions $ \(bc :: Raw) -> get bc "a" >>= (@?= Just "1")
     ]
 
 -- | Run a generated program against a real store and a 'Data.Map' and check

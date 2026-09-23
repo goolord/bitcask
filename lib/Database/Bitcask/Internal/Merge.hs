@@ -22,22 +22,20 @@ module Database.Bitcask.Internal.Merge
   ) where
 
 import Control.Concurrent.MVar
-import Control.Exception (SomeException, mask_, onException, throwIO, try)
-import Control.Monad (foldM, void, when)
+import Control.Exception (mask_, onException, throwIO)
+import Control.Monad (foldM, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef
 import qualified Data.List as L
 import Data.Word (Word64)
 import qualified Data.Map.Strict as M
-import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 
 import Database.Bitcask.Internal.File (dataPath, hintPath, listDataFiles, readPending, writePending)
 import Database.Bitcask.Internal.Hint (HintEntry (..), encodeHintEntry)
 import qualified Database.Bitcask.Internal.Keydir as KD
-import Database.Bitcask.Internal.Platform (closeAppend, preadAt, removeOpen)
-import Database.Bitcask.Internal.Record (Record (..), decodeRecord)
+import Database.Bitcask.Internal.Platform (preadAt, removeOpen)
 import Database.Bitcask.Internal.Store
 import Database.Bitcask.Types
 
@@ -58,10 +56,10 @@ shouldMerge st = case mergePolicy (stOpts st) of
 mergeStore :: Store -> IO MergeStats
 mergeStore st = withMVar (stMergeGate st) $ \() -> do
   assertOpen st
-  when (readOnly (stOpts st)) $ throwIO WriteToReadOnly
 
   -- Roll first so every input stays immutable for the whole merge. This is the
-  -- only time merge touches the write path. Fails on a broken store.
+  -- only time merge touches the write path. Fails on a read-only or broken
+  -- store.
   activeFid <- withActive st $ \ac ->
     if acOffset ac > 0
       then do
@@ -145,46 +143,40 @@ copyOne st current out0 k loc swept = do
     Just b -> pure b
     Nothing -> withReader st (locFileId loc) $ \rh ->
       preadAt rh (locPos loc) (fromIntegral (locSize loc))
-  if BS.length bytes < fromIntegral (locSize loc)
-    then pure out0 -- stale entry; the newer write wins
-    else case decodeRecord (verifyChecksums (stOpts st)) bytes of
-      Left err -> throwIO (CorruptRecord (dataPath (stDir st) (locFileId loc)) (locPos loc) err)
-      Right r
-        | recKey r /= k || isNothing (recValue r) -> pure out0
-        | otherwise -> do
-            out <-
-              if needsRoll (outActive out0) (BS.length bytes)
-                then do
-                  o <- flushOut st out0
-                  a <- rollMergeOutput st current (outActive o)
-                  pure o {outActive = a}
-                else pure out0
-            let ac = outActive out
-                off = acOffset ac
-                hintBytes =
-                  encodeHintEntry
-                    HintEntry
-                      { hintTstamp = recTstamp r
-                      , hintTombstone = False
-                      , hintKey = k
-                      , hintValSize = maybe 0 (fromIntegral . BS.length) (recValue r)
-                      , hintPos = off
-                      , hintRecSize = locSize loc
-                      }
-                newLoc = Loc (acFileId ac) off (locSize loc) (recTstamp r)
-            ac' <- appendHint st ac {acOffset = off + fromIntegral (BS.length bytes)} hintBytes
-            let out' =
-                  out
-                    { outActive = ac'
-                    , outPending = Claim k loc newLoc : outPending out
-                    , outPendingBytes = bytes : outPendingBytes out
-                    , outPendingLen = outPendingLen out + BS.length bytes
-                    , outCopied = outCopied out + 1
-                    }
-            if outPendingLen out' >= mergeBlockSize then flushOut st out' else pure out'
-  where
-    needsRoll ac len =
-      acOffset ac > 0 && acOffset ac + fromIntegral len > maxFileSize (stOpts st)
+  -- Inputs can't change while merge holds the gate, so a location that doesn't
+  -- hold this key's record is corruption, not a race. Skipping it would delete
+  -- the only copy along with the input.
+  v <- either (throwIO . corruptAt st loc) pure (checkRecord st k loc bytes)
+  out <-
+    if needsRoll st (outActive out0) (BS.length bytes)
+      then do
+        o <- flushOut st out0
+        a <- rollMergeOutput st current (outActive o)
+        pure o {outActive = a}
+      else pure out0
+  let ac = outActive out
+      off = acOffset ac
+      hintBytes =
+        encodeHintEntry
+          HintEntry
+            { hintTstamp = locTstamp loc
+            , hintTombstone = False
+            , hintKey = k
+            , hintValSize = fromIntegral (BS.length v)
+            , hintPos = off
+            , hintRecSize = locSize loc
+            }
+      newLoc = loc {locFileId = acFileId ac, locPos = off}
+  ac' <- appendHint st ac {acOffset = off + fromIntegral (BS.length bytes)} hintBytes
+  let out' =
+        out
+          { outActive = ac'
+          , outPending = Claim k loc newLoc : outPending out
+          , outPendingBytes = bytes : outPendingBytes out
+          , outPendingLen = outPendingLen out + BS.length bytes
+          , outCopied = outCopied out + 1
+          }
+  if outPendingLen out' >= mergeBlockSize then flushOut st out' else pure out'
 
 -- | Write the pending copies, then point the keydir at them.
 flushOut :: Store -> Out -> IO Out
@@ -242,12 +234,8 @@ finishOutput st current out = do
 -- open scans the file and stops at the bad tail.
 abandonOutput :: Store -> Active -> IO ()
 abandonOutput st out = do
-  quietly (closeAppend (acHint out))
-  quietly (closeAppend (acData out))
-  _ <- removeOpen (hintPath (stDir st) (acFileId out))
-  pure ()
-  where
-    quietly act = void (try act :: IO (Either SomeException ()))
+  releaseActive out
+  void (removeOpen (hintPath (stDir st) (acFileId out)))
 
 -- | Delete the merged input files.
 --
@@ -261,9 +249,9 @@ removeInputs st inputs = do
   stuck <- foldM removeOne [] inputs
   atomicModifyIORef' (stTotal st) (\m -> (foldr M.delete m inputs, ()))
   atomicModifyIORef' (stDead st) (\m -> (foldr M.delete m inputs, ()))
-  when (not (null stuck)) $ do
+  unless (null stuck) $ do
     existing <- readPending (stDir st)
-    writePending (stDir st) (existing <> reverse stuck)
+    writePending (stDir st) (L.nub (existing <> reverse stuck))
   where
     removeOne acc fid = do
       retireReader st fid

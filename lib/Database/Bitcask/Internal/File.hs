@@ -25,7 +25,7 @@ module Database.Bitcask.Internal.File
   ) where
 
 import Control.Exception (IOException, throwIO, try)
-import Control.Monad (forM, unless)
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BB
@@ -41,6 +41,7 @@ import System.FilePath ((</>))
 import Text.Printf (printf)
 import Text.Read (readMaybe)
 
+import Database.Bitcask.Internal.Bytes (indexBE16, indexBE32)
 import Database.Bitcask.Internal.Hint (HintEntry (..), decodeHintFile)
 import Database.Bitcask.Internal.Keydir (Ref (..))
 import Database.Bitcask.Internal.Platform (ReadHandle, preadAt)
@@ -48,6 +49,7 @@ import Database.Bitcask.Internal.Record
   ( Record (..)
   , decodeHeader
   , decodeRecord
+  , headerSize
   , recordSize
   )
 import Database.Bitcask.Types
@@ -113,12 +115,12 @@ foldDataFile verify path fid rh size step = go 0 BS.empty
     go off buf acc
       | off >= size = pure (acc, Nothing)
       | otherwise = case decodeHeader buf of
-          Left TruncatedRecord {} -> refill off buf acc
-          Left err -> tornOrCorrupt off err acc Nothing
+          -- Only fails for want of bytes.
+          Left _ -> refill off buf acc headerSize
           Right h
-            | BS.length buf < recordSize h -> refill off buf acc
+            | BS.length buf < recordSize h -> refill off buf acc (recordSize h)
             | otherwise -> case decodeRecord verify buf of
-                Left err -> tornOrCorrupt off err acc (Just h)
+                Left err -> tornOrCorrupt off err acc h
                 Right r ->
                   let n = recordSize h
                       ref =
@@ -130,31 +132,27 @@ foldDataFile verify path fid rh size step = go 0 BS.empty
                       acc' = step acc ref
                    in acc' `seq` go (off + fromIntegral n) (BS.drop n buf) acc'
 
-    -- Read the next chunk onto the end of the buffer.
-    refill off buf acc = do
+    -- Read onto the end of the buffer so it holds the @need@ bytes of the
+    -- record at @off@, and at least a chunk. One read even for a big record,
+    -- and never past EOF, whatever size a corrupt header claims.
+    refill off buf acc need = do
       let have = off + fromIntegral (BS.length buf)
       if have >= size
         then
           -- EOF and no whole record left in the buffer.
           pure (acc, if BS.null buf then Nothing else Just off)
         else do
-          more <- preadAt rh have chunkSize
+          let want = max chunkSize (need - BS.length buf)
+          more <- preadAt rh have (fromIntegral (min (size - have) (fromIntegral want)))
           if BS.null more
             then pure (acc, if BS.null buf then Nothing else Just off)
             else go off (buf <> more) acc
 
     -- Only a torn tail if the record would run to EOF. Anywhere else it's
     -- corruption, and skipping it would bring back an older value.
-    tornOrCorrupt off err acc mh =
-      let reachesEnd = case mh of
-            Nothing -> False
-            Just h -> off + fromIntegral (recordSize h) >= size
-       in if reachesEnd || isNothing mh && off + headerBytes >= size
-            then pure (acc, Just off)
-            else throwIO (CorruptRecord path off err)
-
-    headerBytes :: Word64
-    headerBytes = 19
+    tornOrCorrupt off err acc h
+      | off + fromIntegral (recordSize h) >= size = pure (acc, Just off)
+      | otherwise = throwIO (CorruptRecord path off err)
 
 -- | Turn a hint entry into a keydir ref.
 refFromHint :: FileId -> HintEntry -> Ref
@@ -171,17 +169,13 @@ refFromHint fid e =
 -- The file is validated up front; the list is lazy.
 readHintRefs :: FilePath -> FileId -> IO (Maybe [Ref])
 readHintRefs dir fid = do
-  let p = hintPath dir fid
-  exists <- doesFileExist p
-  if not exists
-    then pure Nothing
-    else do
-      r <- try (BS.readFile p)
-      pure $! case r of
-        Left (_ :: IOException) -> Nothing
-        Right bs -> case decodeHintFile bs of
-          Left _ -> Nothing
-          Right es -> Just (map (refFromHint fid) es)
+  r <- try (BS.readFile (hintPath dir fid))
+  pure $! case r of
+    -- Includes there being no hint file.
+    Left (_ :: IOException) -> Nothing
+    Right bs -> case decodeHintFile bs of
+      Left _ -> Nothing
+      Right es -> Just (map (refFromHint fid) es)
 
 -- | Bump on incompatible format changes.
 formatVersion :: Word32
@@ -201,16 +195,13 @@ readMeta dir = do
       bs <- BS.readFile p
       unless (metaMagic `BS.isPrefixOf` bs && BS.length bs >= 14) $
         throwIO (NotAStore dir)
-      let ver = be32 (BS.drop 8 bs)
-          tagLen = fromIntegral (be16 (BS.drop 12 bs))
+      let ver = indexBE32 bs 8
+          tagLen = fromIntegral (indexBE16 bs 12)
           tagBytes = BS.take tagLen (BS.drop 14 bs)
       pure . Just $
         ( ver
         , if tagLen == 0 then Nothing else either (const Nothing) Just (TE.decodeUtf8' tagBytes)
         )
-  where
-    be16 b = (fromIntegral (BS.index b 0) * 256 + fromIntegral (BS.index b 1)) :: Word32
-    be32 b = foldl (\a i -> a * 256 + fromIntegral (BS.index b i)) 0 [0 .. 3] :: Word32
 
 writeMeta :: FilePath -> Maybe Text -> IO ()
 writeMeta dir tag =
@@ -236,7 +227,4 @@ readPending dir = do
         BC.lines bs
 
 writePending :: FilePath -> [FileId] -> IO ()
-writePending dir fids =
-  BS.writeFile (pendingPath dir) . BC.unlines =<< forM fids (pure . BC.pack . stem)
-  where
-    stem fid = printf "%010u-%010u" (fileBase fid) (fileSub fid)
+writePending dir fids = BS.writeFile (pendingPath dir) (BC.unlines (map (BC.pack . fileStem) fids))

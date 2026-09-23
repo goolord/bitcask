@@ -18,13 +18,14 @@ import Data.ByteString.Builder (Builder)
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Builder.Extra as BBE
 import qualified Data.ByteString.Lazy as BL
-import Data.Bits (Bits, shiftL)
 import Data.Int (Int32, Int64)
 import qualified Data.Serialize as Cereal
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64, Word8)
 import GHC.Float (castWord64ToDouble)
+
+import Database.Bitcask.Internal.Bytes (indexBE32, indexBE64)
 
 -- | Encoding and decoding for keys and values.
 --
@@ -125,9 +126,12 @@ fixed n f name bs
   | BS.length bs == n = Right (f bs)
   | otherwise = Left (name <> ": expected " <> show n <> " bytes, got " <> show (BS.length bs))
 
--- | Big-endian decode of a fixed-width unsigned integer.
-be :: (Bits a, Num a) => ByteString -> a
-be = BS.foldl' (\acc b -> (acc `shiftL` 8) + fromIntegral b) 0
+-- | Big-endian decodes, once 'fixed' has checked the length.
+be32 :: ByteString -> Word32
+be32 bs = indexBE32 bs 0
+
+be64 :: ByteString -> Word64
+be64 bs = indexBE64 bs 0
 
 instance Codec Word8 where
   toBytes = BB.word8
@@ -135,19 +139,19 @@ instance Codec Word8 where
 
 instance Codec Word32 where
   toBytes = BB.word32BE
-  fromBytes = fixed 4 be "Codec Word32"
+  fromBytes = fixed 4 be32 "Codec Word32"
 
 instance Codec Word64 where
   toBytes = BB.word64BE
-  fromBytes = fixed 8 be "Codec Word64"
+  fromBytes = fixed 8 be64 "Codec Word64"
 
 instance Codec Int32 where
   toBytes = BB.int32BE
-  fromBytes = fixed 4 (fromIntegral @Word32 . be) "Codec Int32"
+  fromBytes = fixed 4 (fromIntegral . be32) "Codec Int32"
 
 instance Codec Int64 where
   toBytes = BB.int64BE
-  fromBytes = fixed 8 (fromIntegral @Word64 . be) "Codec Int64"
+  fromBytes = fixed 8 (fromIntegral . be64) "Codec Int64"
 
 -- | Big-endian 'Int64', so the encoding doesn't depend on word size.
 instance Codec Int where

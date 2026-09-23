@@ -45,3 +45,17 @@
   * A failed merge closes its output and only removes inputs once the output
     is synced.
   * Fault hooks (`injectFault`) for testing these paths.
+* Locking, merge and close:
+  * Read-only handles in one process share a single OS lock, and nothing
+    shares with a writer. Before, closing a read-only handle on POSIX could
+    drop the writer's lock, and on Windows two read-only opens conflicted.
+  * A live record that can't be read is reported as `CorruptRecord` (new
+    `UnexpectedRecord` for the wrong key or a tombstone). Merge used to skip
+    it and then delete the file holding it. `get` used to return `Nothing`.
+  * Files a merge couldn't delete are never replayed. Read-only opens used to
+    load them, and a second failed delete dropped them from
+    `bitcask.pending`, which could bring back deleted keys.
+  * `close` waits for a merge running on another thread, and can interrupt
+    the background merge.
+  * `put` refuses a record whose total size doesn't fit in 32 bits.
+  * A failed open or roll closes the handles it opened.

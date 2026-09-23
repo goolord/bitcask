@@ -277,8 +277,9 @@ newtype LockHandle = LockHandle HANDLE
 
 -- | Take the store lock, or report that someone else has it.
 --
--- A @CreateFile@ with share mode zero is the lock. Windows releases it when
--- the process exits, like @fcntl@ locks on POSIX. Windows doesn't say who holds
+-- The open is the lock: an exclusive lock shares nothing, and a shared lock
+-- only shares reading with other shared locks. Windows releases it when the
+-- process exits, like @fcntl@ locks on POSIX. Windows doesn't say who holds
 -- it, hence the 'Nothing'.
 takeLock :: FilePath -> LockMode -> IO (Either (Maybe Word32) LockHandle)
 takeLock p mode = do
@@ -287,7 +288,7 @@ takeLock p mode = do
       createFile
         p
         access
-        0 -- FILE_SHARE_NONE: the open is the lock
+        share
         Nothing
         oPEN_ALWAYS
         fILE_ATTRIBUTE_NORMAL
@@ -296,9 +297,9 @@ takeLock p mode = do
     Right h -> Right (LockHandle h)
     Left (_ :: IOException) -> Left Nothing
   where
-    access = case mode of
-      LockExclusive -> gENERIC_READ .|. gENERIC_WRITE
-      LockShared -> gENERIC_READ
+    (access, share) = case mode of
+      LockExclusive -> (gENERIC_READ .|. gENERIC_WRITE, 0)
+      LockShared -> (gENERIC_READ, fILE_SHARE_READ)
 
 dropLock :: LockHandle -> IO ()
 dropLock (LockHandle h) = closeHandle h

@@ -25,16 +25,19 @@ module Database.Bitcask.Internal.Store
   , retireReader
   , bumpDead
   , fetchAt
+  , checkRecord
+  , corruptAt
   , sweepRecords
+  , needsRoll
   , rollActive
   , openActive
   , closeActive
+  , releaseActive
   , appendHint
   , withActive
   , markBroken
   , appendData
   , bumpTotal
-  , setDead
   , assertOpen
 
     -- * Fault injection, for tests
@@ -45,8 +48,8 @@ module Database.Bitcask.Internal.Store
 import Control.Concurrent (ThreadId, killThread)
 import Control.Concurrent.MVar
 import Control.Applicative ((<|>))
-import Control.Exception (IOException, SomeAsyncException, SomeException, bracketOnError, fromException, throwIO, toException, try)
-import Control.Monad (foldM, forM_, unless, void, when)
+import Control.Exception (IOException, SomeAsyncException, SomeException, bracketOnError, finally, fromException, onException, throwIO, toException, try)
+import Control.Monad (filterM, foldM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BSU
@@ -59,7 +62,7 @@ import Data.Maybe (fromMaybe, isNothing)
 import qualified Data.Text as T
 import Data.Time.Clock.System (SystemTime (..), getSystemTime)
 import Data.Word (Word32, Word64)
-import System.Directory (createDirectoryIfMissing, getFileSize, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getFileSize, removeFile)
 
 import Database.Bitcask.Internal.CRC32 (crc32Update)
 import Database.Bitcask.Internal.File
@@ -68,7 +71,7 @@ import Database.Bitcask.Internal.Keydir (Keydir)
 import qualified Database.Bitcask.Internal.Keydir as KD
 import Database.Bitcask.Internal.Lock (LockMode (..), StoreLock, acquireLock, releaseLock)
 import Database.Bitcask.Internal.Platform hiding (LockMode (..), dropLock, takeLock)
-import Database.Bitcask.Internal.Record (Record (..), decodeRecord, encodeRecord)
+import Database.Bitcask.Internal.Record (Record (..), decodeRecord, encodeRecord, headerSize)
 import Database.Bitcask.Types
 
 -- | The active data file: the one being appended to, and its hint file.
@@ -143,18 +146,22 @@ assertOpen st = do
 openStore :: FilePath -> OpenOptions -> IO Store
 openStore dir opts = do
   createDirectoryIfMissing True dir
-  checkMeta dir opts
   lockRes <- acquireLock dir (if readOnly opts then LockShared else LockExclusive)
   lock <- case lockRes of
     Left holder -> throwIO (LockHeld dir holder)
     Right l -> pure l
-  bracketOnError (pure lock) releaseLock $ \_ -> do
-    unless (readOnly opts) (sweepPending dir)
-    readers <- Readers <$> newIORef M.empty <*> newMVar ()
-    fids <- listDataFiles dir
+  readers <- Readers <$> newIORef M.empty <*> newMVar ()
+  (`onException` (closeReaders readers `finally` releaseLock lock)) $ do
+    checkMeta dir opts
+    -- Files a merge couldn't delete. Everything live in them is in the merge
+    -- output, so replaying them could only bring back what merge dropped.
+    pending <- if readOnly opts then readPending dir else sweepPending dir
+    onDisk <- listDataFiles dir
+    let fids = filter (`notElem` pending) onDisk
+    kd <- rebuild dir opts readers fids
+    -- After 'rebuild', which may have truncated a torn tail.
     sizes <- mapM (\f -> (,) f . fromIntegral <$> getFileSize (dataPath dir f)) fids
     let totals = M.fromList sizes
-    kd <- rebuild dir opts readers fids
     kdRef <- newIORef kd
     totalRef <- newIORef totals
     deadRef <- newIORef (deadFrom totals kd)
@@ -169,7 +176,8 @@ openStore dir opts = do
       if readOnly opts
         then newMVar Nothing
         else do
-          let base = if null fids then 1 else fileBase (maximum fids) + 1
+          -- Above pending files too, so a pending id is never reused.
+          let base = if null onDisk then 1 else fileBase (maximum onDisk) + 1
           ac <- openActive dir (mkFileId base 0)
           modifyIORef' totalRef (M.insert (acFileId ac) 0)
           newMVar (Just ac)
@@ -218,10 +226,10 @@ checkMeta dir opts = do
 -- Files are visited in id order, which is write order, so the last ref for a
 -- key wins. See "Database.Bitcask.Internal.Keydir".
 rebuild :: FilePath -> OpenOptions -> Readers -> [FileId] -> IO Keydir
-rebuild dir opts readers fids = foldM one KD.empty (zip fids (repeat ()))
+rebuild dir opts readers fids = foldM one KD.empty fids
   where
     lastFid = if null fids then Nothing else Just (maximum fids)
-    one kd (fid, ()) = do
+    one kd fid = do
       mhint <- readHintRefs dir fid
       case mhint of
         Just refs -> pure $! L.foldl' (flip KD.applyRef) kd refs
@@ -271,36 +279,59 @@ dropReader rd fid = withMVar (rdLock rd) $ \() ->
 closeReaderFor :: Readers -> FileId -> IO ()
 closeReaderFor rd fid = dropReader rd fid >>= mapM_ closeRead
 
--- | Delete files a previous merge couldn't remove because a reader had them
--- open. Only happens on Windows.
-sweepPending :: FilePath -> IO ()
+-- | Close every cached read handle.
+closeReaders :: Readers -> IO ()
+closeReaders rd = withMVar (rdLock rd) $ \() ->
+  atomicModifyIORef' (rdMap rd) (\m -> (M.empty, m)) >>= mapM_ closeRead . M.elems
+
+-- | Delete files a previous merge couldn't remove because something had them
+-- open. Only happens on Windows. Returns the ones still there, which stay in
+-- the manifest.
+sweepPending :: FilePath -> IO [FileId]
 sweepPending dir = do
   fids <- readPending dir
-  unless (null fids) $ do
-    forM_ fids $ \fid -> do
-      _ <- removeOpen (dataPath dir fid)
-      _ <- removeOpen (hintPath dir fid)
-      pure ()
-    _ <- try (removeFile (pendingPath dir)) :: IO (Either IOException ())
-    pure ()
+  stuck <- flip filterM fids $ \fid -> do
+    _ <- removeOpen (hintPath dir fid)
+    _ <- removeOpen (dataPath dir fid)
+    doesFileExist (dataPath dir fid)
+  unless (null fids) $
+    if null stuck
+      then void (try (removeFile (pendingPath dir)) :: IO (Either IOException ()))
+      else writePending dir stuck
+  pure stuck
 
+-- | Open a data file and its hint file for appending. If a step fails, what
+-- was already opened is closed.
 openActive :: FilePath -> FileId -> IO Active
-openActive dir fid = do
-  (dh, off) <- openAppend (dataPath dir fid)
-  (hh, _) <- openAppend (hintPath dir fid)
-  syncDir dir
-  pure
-    Active
-      { acFileId = fid
-      , acData = dh
-      , acHint = hh
-      , acOffset = off
-      , acHintCrc = 0
-      , acHintCount = 0
-      , acHintBuf = []
-      , acHintBufLen = 0
-      , acHintOk = True
-      }
+openActive dir fid =
+  bracketOnError (openAppend (dataPath dir fid)) (closeAppend . fst) $ \(dh, off) ->
+    bracketOnError (openAppend (hintPath dir fid)) (closeAppend . fst) $ \(hh, _) -> do
+      syncDir dir
+      pure
+        Active
+          { acFileId = fid
+          , acData = dh
+          , acHint = hh
+          , acOffset = off
+          , acHintCrc = 0
+          , acHintCount = 0
+          , acHintBuf = []
+          , acHintBufLen = 0
+          , acHintOk = True
+          }
+
+-- | Close both of an active file's handles, ignoring errors.
+releaseActive :: Active -> IO ()
+releaseActive ac = do
+  quietly (closeAppend (acHint ac))
+  quietly (closeAppend (acData ac))
+  where
+    quietly act = void (try act :: IO (Either SomeException ()))
+
+-- | Whether a record of @n@ bytes should go in a new file. An empty file takes
+-- any record, however big.
+needsRoll :: Store -> Active -> Int -> Bool
+needsRoll st ac n = acOffset ac > 0 && acOffset ac + fromIntegral n > maxFileSize (stOpts st)
 
 -- | Add an entry to the active file's hint file.
 --
@@ -368,8 +399,7 @@ closeActive st ac0 = do
         appendBytes (acHint ac) (encodeHintTrailer (acHintCount ac) (acHintCrc ac))
         syncFile (acHint ac)) :: IO (Either SomeException ()))
       else pure False
-  quietly (closeAppend (acHint ac))
-  quietly (closeAppend (acData ac))
+  releaseActive ac
   -- A hint with no trailer is ignored on open anyway. Remove it to tidy up.
   unless hinted $ void (removeOpen (hintPath (stDir st) (acFileId ac)))
   -- The new file's directory entry needs syncing too.
@@ -377,8 +407,6 @@ closeActive st ac0 = do
   forM_ (leftToMaybe dirSynced) $ \e ->
     markBroken st ("sync of directory " <> stDir st <> " failed: " <> show e)
   pure (leftToMaybe synced <|> leftToMaybe dirSynced)
-  where
-    quietly act = void (try act :: IO (Either SomeException ()))
 
 -- | Roll to a fresh active file.
 --
@@ -411,7 +439,10 @@ rollActive st ac = do
 withActive :: Store -> (Active -> IO (Active, Either SomeException a)) -> IO a
 withActive st step = do
   r <- modifyMVarMasked (stActive st) $ \case
-    Nothing -> pure (Nothing, Left (toException WriteToReadOnly))
+    Nothing -> do
+      -- 'closeStore' empties it too.
+      closed <- readIORef (stClosed st)
+      pure (Nothing, Left (toException (if closed then UseAfterClose else WriteToReadOnly)))
     Just ac -> do
       broken <- readIORef (stBroken st)
       case broken of
@@ -507,7 +538,8 @@ getRaw st k = do
 --
 -- A location can go stale under a concurrent merge: the file may be gone, or
 -- the offset may hold a different record. That shows up as a failed read, a
--- short read, or the wrong key, and in each case we look the key up again.
+-- short read, or the wrong key, and in each case we look the key up again. If
+-- it keeps happening, the file is corrupt.
 fetchAt :: Store -> ByteString -> Loc -> Int -> IO (Maybe ByteString)
 fetchAt st k loc attempt = do
   res <- try (withReader st (locFileId loc) $ \rh -> preadAt rh (locPos loc) (fromIntegral (locSize loc)))
@@ -515,17 +547,11 @@ fetchAt st k loc attempt = do
     Left (e :: IOException)
       | attempt < maxAttempts -> again
       | otherwise -> throwIO e
-    Right bs
-      | BS.length bs < fromIntegral (locSize loc) ->
-          if attempt < maxAttempts then again else pure Nothing
-      | otherwise -> case decodeRecord (verifyChecksums (stOpts st)) bs of
-          Left err
-            | attempt < maxAttempts -> again
-            | otherwise -> throwIO (CorruptRecord (dataPath (stDir st) (locFileId loc)) (locPos loc) err)
-          Right r
-            | recKey r /= k ->
-                if attempt < maxAttempts then again else pure Nothing
-            | otherwise -> pure (recValue r)
+    Right bs -> case checkRecord st k loc bs of
+      Right v -> pure (Just v)
+      Left err
+        | attempt < maxAttempts -> again
+        | otherwise -> throwIO (corruptAt st loc err)
   where
     maxAttempts = 3 :: Int
     again = do
@@ -533,6 +559,22 @@ fetchAt st k loc attempt = do
       case KD.lookup k kd of
         Nothing -> pure Nothing
         Just loc' -> fetchAt st k loc' (attempt + 1)
+
+-- | Check that the bytes read from a key's location are that key's live
+-- record, and return the value.
+checkRecord :: Store -> ByteString -> Loc -> ByteString -> Either RecordError ByteString
+checkRecord st k loc bs
+  | BS.length bs < size = Left (TruncatedRecord size (BS.length bs))
+  | otherwise = do
+      r <- decodeRecord (verifyChecksums (stOpts st)) bs
+      case recValue r of
+        Just v | recKey r == k -> Right v
+        _ -> Left UnexpectedRecord
+  where
+    size = fromIntegral (locSize loc)
+
+corruptAt :: Store -> Loc -> RecordError -> BitcaskError
+corruptAt st loc = CorruptRecord (dataPath (stDir st) (locFileId loc)) (locPos loc)
 
 memberRaw :: Store -> ByteString -> IO Bool
 memberRaw st k = do
@@ -546,8 +588,9 @@ keysRaw st = do
 
 -- | Strict left fold over every live key and value.
 --
--- Folds over a snapshot of the keydir. Values are read as it goes, and a key
--- deleted mid-fold is skipped.
+-- Folds over a snapshot of the keydir taken at the start. A key overwritten or
+-- deleted mid-fold is usually visited with its old value. If a merge moved it
+-- in the meantime, it's visited with its current value, or skipped if deleted.
 foldRaw :: Store -> (a -> ByteString -> ByteString -> IO a) -> a -> IO a
 foldRaw st f z = do
   assertOpen st
@@ -555,11 +598,9 @@ foldRaw st f z = do
   sweepRecords st step z (KD.toList kd)
   where
     step acc k loc mbytes = do
-      mv <- case decodeRecord (verifyChecksums (stOpts st)) <$> mbytes of
-        Just (Right r)
-          | recKey r == k, Just v <- recValue r ->
-              -- Copy so a retained value doesn't retain the whole read window.
-              pure (Just (BS.copy v))
+      mv <- case checkRecord st k loc <$> mbytes of
+        -- Copy so a retained value doesn't retain the whole read window.
+        Just (Right v) -> pure (Just (BS.copy v))
         -- Otherwise take the slow path, which retries around a concurrent
         -- merge and reports real corruption.
         _ -> fetchAt st k loc 0
@@ -620,7 +661,9 @@ foldRefsRaw st f z = do
 
 putRaw :: Store -> ByteString -> ByteString -> IO ()
 putRaw st k v = do
-  when (BS.length v > maxValueSize) $ throwIO (ValueTooLarge (BS.length v))
+  -- The whole record's size is a 'Word32' ('locSize'), not just the value's.
+  when (BS.length v > maxValueSize - headerSize - BS.length k) $
+    throwIO (ValueTooLarge (BS.length v))
   appendRecord st k (Just v)
 
 deleteRaw :: Store -> ByteString -> IO ()
@@ -649,7 +692,7 @@ appendRecord st k mv = do
       n = BS.length bytes
   withActive st $ \ac0 -> do
     (ac, rollErr) <-
-      if needsRoll ac0 n then rollActive st ac0 else pure (ac0, Nothing)
+      if needsRoll st ac0 n then rollActive st ac0 else pure (ac0, Nothing)
     case rollErr of
       Just e -> pure (ac, Left e)
       Nothing -> do
@@ -683,9 +726,6 @@ appendRecord st k mv = do
               markBroken st ("sync of " <> dataPath (stDir st) (acFileId ac) <> " failed: " <> show e)
             pure (ac', synced)
   where
-    needsRoll ac n =
-      acOffset ac > 0 && acOffset ac + fromIntegral n > maxFileSize (stOpts st)
-
     -- Part of the record may have been written. Truncate so the file ends at
     -- 'acOffset'.
     undoWrite ac (e :: SomeException) = do
@@ -714,9 +754,6 @@ maybeSync st ac = case syncPolicy (stOpts st) of
 
 bumpDead :: Store -> FileId -> Word64 -> IO ()
 bumpDead st fid n = atomicModifyIORef' (stDead st) (\m -> (M.insertWith (+) fid n m, ()))
-
-setDead :: Store -> FileId -> Word64 -> IO ()
-setDead st fid n = atomicModifyIORef' (stDead st) (\m -> (M.insert fid n m, ()))
 
 bumpTotal :: Store -> FileId -> Word64 -> IO ()
 bumpTotal st fid n = atomicModifyIORef' (stTotal st) (\m -> (M.insertWith (+) fid n m, ()))
@@ -762,13 +799,16 @@ closeStore st = do
   already <- atomicModifyIORef' (stClosed st) (\c -> (True, c))
   unless already $ do
     readIORef (stThreads st) >>= mapM_ killThread
+    -- Wait out a merge on another thread, so nothing writes or deletes files
+    -- once the lock is gone. Merges that start later see 'UseAfterClose'.
+    readMVar (stMergeGate st)
     failed <- modifyMVarMasked (stActive st) $ \case
       Nothing -> pure (Nothing, Nothing)
       Just ac -> (,) Nothing <$> closeActive st ac
-    let rd = stReaders st
-    withMVar (rdLock rd) $ \() ->
-      atomicModifyIORef' (rdMap rd) (\m -> (M.empty, m)) >>= mapM_ closeRead . M.elems
-    readIORef (stRetired st) >>= mapM_ closeRead
-    writeIORef (stRetired st) []
-    releaseLock (stLock st)
+    ( do
+        closeReaders (stReaders st)
+        readIORef (stRetired st) >>= mapM_ closeRead
+        writeIORef (stRetired st) []
+      )
+      `finally` releaseLock (stLock st)
     mapM_ throwIO failed

@@ -21,7 +21,6 @@ module Database.Bitcask.Internal.Keydir
   , replaceIf
   , keys
   , toList
-  , foldlWithKey'
   , foldlLocs'
   , size
   , liveBytes
@@ -105,10 +104,6 @@ keys (Keydir m) = map SBS.fromShort (HM.keys m)
 
 toList :: Keydir -> [(ByteString, Loc)]
 toList (Keydir m) = [(SBS.fromShort k, l) | (k, l) <- HM.toList m]
-
--- | Strict left fold over every key and location.
-foldlWithKey' :: (a -> ByteString -> Loc -> a) -> a -> Keydir -> a
-foldlWithKey' f z (Keydir m) = HM.foldlWithKey' (\a k l -> f a (SBS.fromShort k) l) z m
 
 -- | Strict left fold over every location, without building any keys.
 foldlLocs' :: (a -> Loc -> a) -> a -> Keydir -> a

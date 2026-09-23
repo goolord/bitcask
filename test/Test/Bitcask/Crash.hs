@@ -1,6 +1,7 @@
 module Test.Bitcask.Crash (tests) where
 
-import Control.Monad (forM, forM_, unless)
+import Control.Exception (try)
+import Control.Monad (forM, forM_, unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (isSuffixOf)
@@ -48,7 +49,39 @@ tests =
                   "truncated at " <> show cut <> ": store " <> show (M.toList got)
                     <> " expected "
                     <> show (M.toList want)
+    , testCase "a record that can't be read is reported, not dropped by merge" $
+        withSystemTempDirectory "bitcask-short" $ \dir -> do
+          withBitcask dir defaultOptions $ \(bc :: Raw) -> put bc "a" "1" >> put bc "b" "2"
+          -- Cut the end of "b". The hint file still lists it, so open doesn't
+          -- scan and the keydir points past the end of the file.
+          dataFile <- soleDataFile dir
+          size <- getFileSize (dir </> dataFile)
+          truncateFile (dir </> dataFile) (fromIntegral size - 1)
+          withBitcask dir defaultOptions $ \(bc :: Raw) -> do
+            assertCorrupt =<< try (get bc "b")
+            assertCorrupt =<< try (void (merge bc))
+            get bc "a" >>= (@?= Just "1")
+          doesFileExist (dir </> dataFile) >>= assertBool "merge input was deleted"
+    , testCase "a file a merge couldn't delete is never replayed" $
+        withSystemTempDirectory "bitcask-pending" $ \dir -> do
+          withBitcask dir defaultOptions $ \(bc :: Raw) -> put bc "a" "1"
+          -- As if a merge had dropped "a" but couldn't delete its file.
+          dataFile <- soleDataFile dir
+          writeFile (dir </> "bitcask.pending") (takeWhile (/= '.') dataFile <> "\n")
+          let gone opts = withBitcask dir opts $ \(bc :: Raw) -> get bc "a" >>= (@?= Nothing)
+          gone defaultOptions {readOnly = True}
+          -- On Windows the file can't be deleted while this handle is open, so
+          -- it stays pending.
+          withBinaryFile (dir </> dataFile) ReadMode $ \_ -> gone defaultOptions
+          gone defaultOptions {readOnly = True}
+          gone defaultOptions
+          doesFileExist (dir </> dataFile) >>= (@?= False)
     ]
+  where
+    assertCorrupt :: (Show a) => Either BitcaskError a -> Assertion
+    assertCorrupt = \case
+      Left CorruptRecord {} -> pure ()
+      other -> assertFailure ("expected CorruptRecord, got " <> show other)
 
 -- | A short program with overwrites and a delete.
 writes :: [(ByteString, Maybe ByteString)]

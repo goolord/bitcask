@@ -109,7 +109,8 @@ data OpenOptions = OpenOptions
   , verifyChecksums :: !Bool
   -- ^ verify the CRC of every record read
   , repairTruncated :: !Bool
-  -- ^ truncate a torn record at the end of the active file instead of failing
+  -- ^ on open, truncate a torn record at the end of the newest data file.
+  -- Either way the torn bytes are skipped; off, they stay on disk
   , mergePolicy :: !MergePolicy
   , storeTag :: !(Maybe Text)
   -- ^ stored in @bitcask.meta@ and checked on open; catches opening a store
@@ -159,6 +160,9 @@ data RecordError
   | BadFlags !Word8
   | -- | a tombstone with a non-empty value
     MalformedTombstone
+  | -- | the keydir points here for a key, but the record is another key's, or
+    -- a tombstone
+    UnexpectedRecord
   | BadHintTrailer
   deriving stock (Eq, Show)
 
@@ -188,6 +192,8 @@ data BitcaskError
 maxKeySize :: Int
 maxKeySize = 0xFFFF
 
--- | Max encoded value size, 4 GiB (@vsz@ is a 'Word32').
+-- | Max encoded value size, 4 GiB (@vsz@ is a 'Word32'). The whole record,
+-- with its 19-byte header and the key, has to fit in 4 GiB too, so the real
+-- limit is a little lower.
 maxValueSize :: Int
 maxValueSize = 0xFFFFFFFF

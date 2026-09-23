@@ -161,19 +161,17 @@ newtype LockHandle = LockHandle Fd
 -- lock behind.
 takeLock :: FilePath -> LockMode -> IO (Either (Maybe Word32) LockHandle)
 takeLock p mode = do
-  opened <- try (handleToFd =<< openBinaryFile p ReadWriteMode)
-  case opened of
-    Left (_ :: IOException) -> pure (Left Nothing)
-    Right fd -> do
-      taken <- try (setLock fd lock)
-      case taken of
-        Right () -> pure (Right (LockHandle fd))
-        Left (_ :: IOException) -> do
-          held <- try (getLock fd lock) :: IO (Either IOException (Maybe (ProcessID, FileLock)))
-          closeFd fd
-          pure . Left $ case held of
-            Right (Just (pid, _)) -> Just (fromIntegral pid)
-            _ -> Nothing
+  -- Failing to open the file isn't a conflict, so that throws.
+  fd <- handleToFd =<< openBinaryFile p ReadWriteMode
+  taken <- try (setLock fd lock)
+  case taken of
+    Right () -> pure (Right (LockHandle fd))
+    Left (_ :: IOException) -> do
+      held <- try (getLock fd lock) :: IO (Either IOException (Maybe (ProcessID, FileLock)))
+      closeFd fd
+      pure . Left $ case held of
+        Right (Just (pid, _)) -> Just (fromIntegral pid)
+        _ -> Nothing
   where
     lock = (req, AbsoluteSeek, 0, 0)
     req = case mode of

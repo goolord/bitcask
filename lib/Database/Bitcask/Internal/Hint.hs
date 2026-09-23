@@ -31,7 +31,7 @@ import Foreign.Storable (pokeByteOff)
 
 import Database.Bitcask.Internal.Bytes
 import Database.Bitcask.Internal.CRC32 (crc32)
-import Database.Bitcask.Internal.Record (tombstoneFlag)
+import Database.Bitcask.Internal.Record (headerSize, tombstoneFlag)
 import Database.Bitcask.Types (Offset, RecordError (..))
 
 data HintEntry = HintEntry
@@ -111,6 +111,6 @@ decodeHintFile bs
                   , hintKey = BSU.unsafeTake ksz (BSU.unsafeDrop (off + hintEntrySize) body)
                   , hintValSize = vsz
                   , hintPos = indexBE64 body (off + 15)
-                  , hintRecSize = fromIntegral (19 + ksz) + vsz
+                  , hintRecSize = fromIntegral (headerSize + ksz) + vsz
                   }
            in e : entries (off + hintEntrySize + ksz)
